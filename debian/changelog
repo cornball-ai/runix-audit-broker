@@ -1,0 +1,7 @@
+runix-audit-broker (0.0.1) unstable; urgency=medium
+
+  * Initial packaging: socket-activated audit broker. Framing, hardened sink,
+    and peer credentials implemented and tested; strict json-c parse layer
+    and the accept/dispatch loop in progress.
+
+ -- Troy Hernandez <troy@cornball.ai>  Sat, 08 Aug 2026 00:00:00 -0500

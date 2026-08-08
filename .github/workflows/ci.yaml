@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libjson-c-dev pkg-config clang
+
+      - name: Core unit tests (ASan/UBSan)
+        run: make test
+
+      # The steps below activate once the JSON layer (src/main.c) exists;
+      # until then they skip, keeping CI green during the initial build-out.
+      - name: Build broker (Debian hardening flags)
+        if: ${{ hashFiles('src/main.c') != '' }}
+        run: make
+
+      - name: Sanitizer build
+        if: ${{ hashFiles('src/main.c') != '' }}
+        run: |
+          make clean
+          make CC=clang CFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      - name: Protocol fuzz (short)
+        if: ${{ hashFiles('fuzz/fuzz_frame.c') != '' }}
+        run: |
+          make clean
+          make fuzz
+          ./fuzz-proto -runs=200000 -max_total_time=60
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y devscripts debhelper libjson-c-dev pkg-config build-essential
+      - name: Build the .deb (once the binary builds)
+        if: ${{ hashFiles('src/main.c') != '' }}
+        run: dpkg-buildpackage -us -uc -b

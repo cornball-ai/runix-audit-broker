@@ -4,6 +4,7 @@
 *.so
 /build/
 /audit-broker
+/build-test-core
 /fuzz-proto
 *.deb
 *.buildinfo

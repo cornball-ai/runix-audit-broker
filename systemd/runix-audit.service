@@ -1,0 +1,46 @@
+[Unit]
+Description=Runix audit broker
+Documentation=https://github.com/cornball-ai/runix-audit-broker
+Requires=runix-audit.socket
+After=runix-audit.socket
+
+[Service]
+Type=simple
+# Socket-activated: the listening socket is passed in; the broker accepts
+# connections and exits when idle, so it is not resident when unused.
+ExecStart=/usr/libexec/runix/audit-broker
+
+# Runs as root only to write the root-owned system sink; everything else is
+# stripped. The sink path is fixed in the broker, never a client input.
+User=root
+LogsDirectory=runix
+LogsDirectoryMode=0750
+
+# Sandboxing.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged ~@resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# No [Install]: the service is pulled in by runix-audit.socket on demand
+# (socket activation), never started directly or at boot.
