@@ -28,8 +28,10 @@ PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec
 UNITDIR ?= /lib/systemd/system
 
-.PHONY: all test asan clean install
+.PHONY: all test test-json check asan clean install
 all: $(BIN)
+
+check: test test-json
 
 # The full broker binary (needs libjansson-dev + the JSON/main sources).
 $(BIN): $(BROKER_SRC)
@@ -41,8 +43,14 @@ test: $(CORE) tests/test_core.c
 	    $^ -o build-test-core
 	./build-test-core
 
+# Parser/schema tests against system Jansson, built with ASan/UBSan.
+test-json: src/json.c tests/test_json.c
+	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) \
+	    -fsanitize=address,undefined -g $^ -o build-test-json $(JSON_LIBS)
+	./build-test-json
+
 clean:
-	rm -f $(BIN) build-test-core src/*.o
+	rm -f $(BIN) build-test-core build-test-json src/*.o
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) \

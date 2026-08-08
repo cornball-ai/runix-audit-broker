@@ -15,8 +15,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libjansson-dev pkg-config clang
 
-      - name: Core unit tests (ASan/UBSan)
-        run: make test
+      - name: Unit tests, core + parser (ASan/UBSan)
+        run: make check
 
       # The steps below activate once the JSON layer (src/main.c) exists;
       # until then they skip, keeping CI green during the initial build-out.
