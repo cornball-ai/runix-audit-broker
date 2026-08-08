@@ -41,9 +41,13 @@ Exactly two `type`s. Any other is `unknown_request`.
   "record": { /* domain content: outcome, effect_issued, observed, ... */ } }
 ```
 
+- The body is parsed by **Jansson** (system, apt-serviced) with
+  `JSON_REJECT_DUPLICATES` (native duplicate-key rejection), strict EOF (no
+  trailing content), `JSON_VALIDATE_UTF8`, and a bounded parse depth. No
+  hand-written parser.
 - The `record` is validated against the durable-audit schema: required fields
-  present, correct types, integers in range, **no** unexpected fields, no
-  trailing content after the JSON object, bounded nesting depth.
+  present, correct types, integers in range, **no** unexpected fields,
+  bounded nesting depth.
 - Any `actor`/identity field in `record` is **ignored**: the broker stamps the
   actor from `SO_PEERCRED` (uid/gid/pid) over anything the payload claims.
 - The broker mints `correlation_id`, `schema_version`, `host`, `pid`, `time`,

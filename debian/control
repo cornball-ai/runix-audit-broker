@@ -2,7 +2,7 @@ Source: runix-audit-broker
 Section: admin
 Priority: optional
 Maintainer: Troy Hernandez <troy@cornball.ai>
-Build-Depends: debhelper-compat (= 13), libjson-c-dev, pkg-config
+Build-Depends: debhelper-compat (= 13), libjansson-dev, pkg-config
 Standards-Version: 4.7.0
 Homepage: https://github.com/cornball-ai/runix-audit-broker
 Rules-Requires-Root: no

@@ -13,7 +13,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libjson-c-dev pkg-config clang
+          sudo apt-get install -y build-essential libjansson-dev pkg-config clang
 
       - name: Core unit tests (ASan/UBSan)
         run: make test
@@ -44,7 +44,7 @@ jobs:
       - name: Install packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y devscripts debhelper libjson-c-dev pkg-config build-essential
+          sudo apt-get install -y devscripts debhelper libjansson-dev pkg-config build-essential
       - name: Build the .deb (once the binary builds)
         if: ${{ hashFiles('src/main.c') != '' }}
         run: dpkg-buildpackage -us -uc -b

@@ -1,7 +1,8 @@
-# runix-audit-broker build. The full binary links system json-c; the core
-# (framing, sink, peer) is json-c-independent and has its own sanitized test
+# runix-audit-broker build. The full binary links system Jansson (chosen for
+# native duplicate-key rejection, JSON_REJECT_DUPLICATES); the core (framing,
+# sink, peer, id) is JSON-library-independent and has its own sanitized test
 # target that builds today. `make` (the binary) additionally needs the JSON
-# layer (src/json.c, src/main.c) and libjson-c-dev.
+# layer (src/json.c, src/main.c) and libjansson-dev.
 
 CC ?= gcc
 
@@ -16,12 +17,12 @@ CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 $(WARN) $(DPKG_CFLAGS)
 LDFLAGS += $(DPKG_LDFLAGS)
 
-JSONC_CFLAGS := $(shell pkg-config --cflags json-c 2>/dev/null)
-JSONC_LIBS   := $(shell pkg-config --libs json-c 2>/dev/null)
+JSON_CFLAGS := $(shell pkg-config --cflags jansson 2>/dev/null)
+JSON_LIBS   := $(shell pkg-config --libs jansson 2>/dev/null)
 
 BIN := audit-broker
-CORE := src/proto.c src/sink.c src/peer.c
-BROKER_SRC := $(CORE) src/id.c src/json.c src/main.c
+CORE := src/proto.c src/sink.c src/peer.c src/id.c
+BROKER_SRC := $(CORE) src/json.c src/main.c
 
 PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec
@@ -30,11 +31,11 @@ UNITDIR ?= /lib/systemd/system
 .PHONY: all test asan clean install
 all: $(BIN)
 
-# The full broker binary (needs libjson-c-dev + the JSON/main sources).
+# The full broker binary (needs libjansson-dev + the JSON/main sources).
 $(BIN): $(BROKER_SRC)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(JSONC_CFLAGS) $^ -o $@ $(LDFLAGS) $(JSONC_LIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(JSON_CFLAGS) $^ -o $@ $(LDFLAGS) $(JSON_LIBS)
 
-# Core unit tests, json-c-independent, built with ASan/UBSan.
+# Core unit tests, JSON-library-independent, built with ASan/UBSan.
 test: $(CORE) tests/test_core.c
 	$(CC) $(CPPFLAGS) -std=c11 $(WARN) -fsanitize=address,undefined -g \
 	    $^ -o build-test-core

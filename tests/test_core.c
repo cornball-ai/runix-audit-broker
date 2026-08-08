@@ -1,5 +1,6 @@
 /* Unit tests for the json-c-independent core: framing, hardened sink, and
  * peer credentials. Built with ASan/UBSan (see Makefile `make test`). */
+#include "../src/id.h"
 #include "../src/peer.h"
 #include "../src/proto.h"
 #include "../src/sink.h"
@@ -149,6 +150,34 @@ static void test_peer_cred(void) {
     close(sv[1]);
 }
 
+static void test_ids(void) {
+    char a[RAB_CID_MAX];
+    char b[RAB_CID_MAX];
+    CHECK(rab_make_correlation_id(a, sizeof a) == 0, "correlation id a");
+    CHECK(rab_make_correlation_id(b, sizeof b) == 0, "correlation id b");
+    CHECK(strcmp(a, b) != 0, "correlation ids differ (random suffix)");
+    CHECK(strchr(a, '-') != NULL, "correlation id has separator");
+    CHECK(a[0] >= '0' && a[0] <= '9', "correlation id is time-prefixed");
+
+    char ba[RAB_BINDING_MAX];
+    char bb[RAB_BINDING_MAX];
+    CHECK(rab_make_binding(ba, sizeof ba) == 0, "binding a");
+    CHECK(rab_make_binding(bb, sizeof bb) == 0, "binding b");
+    CHECK(strcmp(ba, bb) != 0, "bindings differ (unguessable)");
+    CHECK(strlen(ba) == 32, "binding is 32 hex chars");
+    int all_hex = 1;
+    for (size_t i = 0; i < 32; i++) {
+        char c = ba[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            all_hex = 0;
+        }
+    }
+    CHECK(all_hex, "binding is lowercase hex");
+
+    char tiny[4];
+    CHECK(rab_make_binding(tiny, sizeof tiny) == -1, "binding fails on tiny buf");
+}
+
 int main(void) {
     test_frame_roundtrip();
     test_frame_too_large();
@@ -157,6 +186,7 @@ int main(void) {
     test_sink_refuses_symlink();
     test_sink_refuses_world_writable();
     test_peer_cred();
+    test_ids();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

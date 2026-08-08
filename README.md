@@ -30,8 +30,9 @@ paranoid:
 - actor identity from `SO_PEERCRED`, never from the payload;
 - exactly two request types (`open_intent`, `write_outcome`);
 - versioned, length-prefixed frames with a hard maximum;
-- strict UTF-8 JSON parsed by system **json-c** (an audited, apt-serviced
-  library) with bounded depth, no trailing content, explicit schema and
+- strict UTF-8 JSON parsed by system **Jansson** (an audited, apt-serviced
+  library with native duplicate-key rejection via `JSON_REJECT_DUPLICATES`)
+  with strict EOF, UTF-8 validation, bounded depth, and explicit schema and
   integer-range checks — no hand-written parser;
 - the broker owns a fixed sink path; a client can never choose where root
   writes;
