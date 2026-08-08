@@ -1,0 +1,16 @@
+# build artifacts
+*.o
+*.a
+*.so
+/build/
+/audit-broker
+/fuzz-proto
+*.deb
+*.buildinfo
+*.changes
+# debian build tree
+/debian/runix-audit-broker/
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper*
+/debian/tmp/
