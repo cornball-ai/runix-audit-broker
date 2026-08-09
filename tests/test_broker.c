@@ -402,6 +402,85 @@ static void test_strict_parsing(void) {
 #undef WITHBROKER
 }
 
+/* Conformance 32: a fixed record built by the R file sink (runix
+ * .finish_record + rsystemd uid:N actor) and by the broker agree field-for-field
+ * on the canonical schema. Byte identity is not required (different encoders,
+ * different insertion order for actor); the broker's `broker` extension is
+ * broker-only. The R line is a committed golden produced by runix/rsystemd. */
+static void test_cross_sink_schema(void) {
+    static const char *R_GOLDEN =
+        "{\"schema_version\":1,\"record_type\":\"audit\",\"correlation_id\":"
+        "\"00001786238615000000-1-abcdef0123456789\",\"phase\":\"intent\","
+        "\"host\":\"troy-ai\",\"pid\":1032147,\"operation\":"
+        "\"systemd.restart\",\"resource\":\"cups.service\",\"scope\":"
+        "\"system\",\"actor\":\"uid:1000\",\"outcome\":\"intent\",\"time\":"
+        "\"2026-08-09T01:23:35Z\"}";
+
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    json_t *dom = json_object();
+    json_object_set_new(dom, "operation", json_string("systemd.restart"));
+    json_object_set_new(dom, "resource", json_string("cups.service"));
+    json_object_set_new(dom, "scope", json_string("system"));
+    json_object_set_new(dom, "outcome", json_string("intent"));
+    char *bline = rab_build_audit(RAB_PHASE_INTENT, "cidX", "bindX", &a, "h",
+                                  1786238615000000ull, dom);
+    json_decref(dom);
+    json_error_t e;
+    json_t *R = json_loads(R_GOLDEN, 0, &e);
+    json_t *B = bline ? json_loads(bline, 0, &e) : NULL;
+    free(bline);
+    CHECK(R != NULL && B != NULL, "both records parse");
+    if (R == NULL || B == NULL) {
+        json_decref(R);
+        json_decref(B);
+        return;
+    }
+
+    /* every canonical R field is present in the broker record with same type */
+    const char *k;
+    json_t *rv;
+    int same_types = 1;
+    json_object_foreach(R, k, rv) {
+        json_t *bv = json_object_get(B, k);
+        if (bv == NULL || json_typeof(bv) != json_typeof(rv)) {
+            same_types = 0;
+        }
+    }
+    CHECK(same_types, "all canonical fields present in broker record, same type");
+
+    /* the broker record adds exactly the broker extension, nothing else */
+    int only_broker_extra = 1;
+    json_object_foreach(B, k, rv) {
+        if (strcmp(k, "broker") == 0) {
+            continue;
+        }
+        if (json_object_get(R, k) == NULL) {
+            only_broker_extra = 0;
+        }
+    }
+    CHECK(only_broker_extra, "broker record adds only the broker extension");
+    CHECK(json_object_get(B, "broker") != NULL, "broker extension present");
+    CHECK(json_object_get(R, "broker") == NULL, "R record has no broker key");
+
+    /* value-fixed canonical fields agree */
+    CHECK(json_integer_value(json_object_get(R, "schema_version")) ==
+              json_integer_value(json_object_get(B, "schema_version")),
+          "schema_version equal");
+    const char *sfields[] = {"record_type", "phase",    "operation", "resource",
+                             "scope",       "actor",     "outcome",   "time"};
+    int vals_equal = 1;
+    for (size_t i = 0; i < sizeof sfields / sizeof sfields[0]; i++) {
+        const char *rvs = json_string_value(json_object_get(R, sfields[i]));
+        const char *bvs = json_string_value(json_object_get(B, sfields[i]));
+        if (rvs == NULL || bvs == NULL || strcmp(rvs, bvs) != 0) {
+            vals_equal = 0;
+        }
+    }
+    CHECK(vals_equal, "record_type/phase/domain/actor/time values agree");
+    json_decref(R);
+    json_decref(B);
+}
+
 static void test_lifecycle_and_reconstruction(void) {
     char dir[256], path[512];
     tmpdir(dir, sizeof dir);
@@ -804,6 +883,7 @@ static void test_rate_limit_survives_restart(void) {
 
 int main(void) {
     test_record_schema();
+    test_cross_sink_schema();
     test_strict_parsing();
     test_lifecycle_and_reconstruction();
     test_identity_and_replay();
