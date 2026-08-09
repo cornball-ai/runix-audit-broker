@@ -22,16 +22,20 @@ JSON_LIBS   := $(shell pkg-config --libs jansson 2>/dev/null)
 
 BIN := audit-broker
 CORE := src/proto.c src/sink.c src/peer.c src/id.c
-BROKER_SRC := $(CORE) src/json.c src/main.c
+BROKER_SRC := $(CORE) src/json.c src/record.c src/broker.c src/main.c
 
 PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec
 UNITDIR ?= /lib/systemd/system
 
-.PHONY: all test test-json test-broker check asan clean install
+.PHONY: all test test-json test-broker test-socket check fuzz probe asan clean install
 all: $(BIN)
 
-check: test test-json test-broker
+# One-shot client used by the activation gate: connect + send one open_intent.
+probe: tools/rab-probe.c src/proto.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o rab-probe $(LDFLAGS)
+
+check: test test-json test-broker test-socket
 
 # The full broker binary (needs libjansson-dev + the JSON/main sources).
 $(BIN): $(BROKER_SRC)
@@ -56,8 +60,30 @@ test-broker: src/broker.c src/record.c src/json.c $(CORE) tests/test_broker.c
 	    -fsanitize=address,undefined -g $^ -o build-test-broker $(JSON_LIBS)
 	./build-test-broker
 
+# An ASan/UBSan build of the whole broker binary, so the daemon runs under the
+# sanitizer during the live socket tests.
+build-broker-asan: $(BROKER_SRC)
+	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) \
+	    -fsanitize=address,undefined -g $^ -o build-broker-asan $(JSON_LIBS)
+
+# Socket-level tests: exec the ASan broker and drive it over AF_UNIX (slowloris,
+# concurrency, disconnect durability, connection limits). Built with ASan/UBSan.
+test-socket: build-broker-asan src/broker.c src/record.c src/json.c $(CORE) \
+             tests/test_socket.c
+	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) \
+	    -fsanitize=address,undefined -g src/broker.c src/record.c src/json.c \
+	    $(CORE) tests/test_socket.c -o build-test-socket $(JSON_LIBS)
+	RAB_BROKER_BIN=./build-broker-asan ./build-test-socket
+
+# Protocol/parser fuzzing. Requires clang (libFuzzer): invoke as
+# `make fuzz CC=clang`. Runs the request parser under the fuzzer + ASan/UBSan.
+fuzz: fuzz/fuzz_frame.c src/json.c
+	$(CC) $(CPPFLAGS) -std=c11 $(JSON_CFLAGS) \
+	    -fsanitize=fuzzer,address,undefined -g $^ -o fuzz-proto $(JSON_LIBS)
+
 clean:
-	rm -f $(BIN) build-test-core build-test-json build-test-broker src/*.o
+	rm -f $(BIN) build-test-core build-test-json build-test-broker \
+	    build-test-socket build-broker-asan fuzz-proto rab-probe src/*.o
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) \

@@ -5,7 +5,14 @@
 /build/
 /audit-broker
 /build-test-*
+/build-broker-asan
 /fuzz-proto
+/rab-probe
+# libFuzzer crash/leak artifacts (the seed corpus in fuzz/corpus is tracked)
+crash-*
+leak-*
+timeout-*
+oom-*
 *.deb
 *.buildinfo
 *.changes
