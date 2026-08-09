@@ -45,7 +45,15 @@ char *rab_build_checkpoint(const char *correlation_id, const char *binding,
                            const char *operation, const char *resource,
                            const char *scope);
 
-typedef enum { RAB_REC_AUDIT, RAB_REC_CHECKPOINT } rab_rec_type;
+/* Build a `broker_rate` record line: the per-uid rate-window history carried
+ * forward during rotation so the per-uid rate limit survives a restart (the
+ * client audit records that seeded it move to the archive, which reconstruction
+ * never reads). `times` are broker-assigned microsecond timestamps, only those
+ * still inside the rate window at rotation time. Returns a malloc'd line or
+ * NULL. */
+char *rab_build_rate(uid_t uid, const unsigned long long *times, size_t n);
+
+typedef enum { RAB_REC_AUDIT, RAB_REC_CHECKPOINT, RAB_REC_RATE } rab_rec_type;
 
 /* The broker-owned facts recovered from one stored line. */
 typedef struct {
@@ -58,11 +66,22 @@ typedef struct {
     char operation[RAB_META_MAX]; /* open-intent metadata ("" if absent) */
     char resource[RAB_META_MAX];
     char scope[RAB_SCOPE_MAX];
+    /* RAB_REC_RATE only: a per-uid carry of rate-window timestamps. rate_times
+     * is malloc'd (NULL if none); free with rab_stored_free. */
+    uid_t rate_uid;
+    unsigned long long *rate_times;
+    size_t rate_n;
 } rab_stored;
 
 /* Parse one stored line into *out. Returns 0 on a well-formed broker record,
  * -1 otherwise. Strict: duplicate keys, a missing correlation id, a missing or
- * malformed `broker` extension, or (for audit) a missing phase all fail. */
+ * malformed `broker` extension, or (for audit) a missing phase all fail. On
+ * success for a RAB_REC_RATE record, *out owns a malloc'd rate_times; release
+ * every parsed *out with rab_stored_free. */
 int rab_parse_stored(const char *line, size_t len, rab_stored *out);
+
+/* Release any heap owned by a parsed record (the RAB_REC_RATE rate_times).
+ * Safe on any *out, including one from a failed parse. */
+void rab_stored_free(rab_stored *out);
 
 #endif /* RAB_RECORD_H */

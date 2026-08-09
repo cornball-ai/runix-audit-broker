@@ -4,6 +4,7 @@
 #include "record.h"
 #include "sink.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -61,6 +62,8 @@ void rab_config_defaults(rab_config *cfg) {
     cfg->rate_max_in_window = 2000;
     cfg->rotate_bytes = 64ull << 20;    /* 64 MiB current-segment cap */
     cfg->min_free_bytes = 64ull << 20;  /* refuse appends below 64 MiB free */
+    cfg->retain_segments = 16;          /* keep at most 16 archived segments */
+    cfg->retain_bytes = 1024ull << 20;  /* and at most 1 GiB total on disk */
 }
 
 static unsigned long long real_clock(void *ctx) {
@@ -246,13 +249,205 @@ static int append_line(rab_broker *b, const char *line) {
     return 0;
 }
 
+/* Carry the per-uid rate-window history into the new segment during rotation:
+ * for each uid, the broker-assigned timestamps still inside the rate window
+ * (only those; older ones are already irrelevant). The client audit records
+ * that seeded the ring move to an archive that reconstruction never reads, so
+ * without this the per-uid rate limit would reset at the next restart. Bounded
+ * by the ring cap. Returns 0, or -1 on a write/alloc failure (rotation is then
+ * aborted, leaving the current segment valid). */
+static int write_rate_carries(rab_broker *b, int fd) {
+    if (b->cfg.rate_max_in_window == 0) {
+        return 0;
+    }
+    unsigned long long now = b->clock(b->clock_ctx);
+    unsigned long long window =
+        (unsigned long long) b->cfg.rate_window_sec * 1000000ull;
+    unsigned long long th = (now > window) ? now - window : 0;
+    for (uid_state *u = b->uids; u != NULL; u = u->next) {
+        if (u->n == 0) {
+            continue;
+        }
+        unsigned long long *tmp = malloc((size_t) u->n * sizeof *tmp);
+        if (tmp == NULL) {
+            return -1;
+        }
+        size_t k = 0;
+        for (unsigned i = 0; i < u->n; i++) {
+            unsigned long long t = u->ring[(u->head + i) % u->cap];
+            if (t >= th) { /* only timestamps still inside the rate window */
+                tmp[k++] = t;
+            }
+        }
+        int rc = 0;
+        if (k > 0) {
+            char *line = rab_build_rate(u->uid, tmp, k);
+            if (line == NULL) {
+                rc = -1;
+            } else {
+                rc = rab_sink_append(fd, line, strlen(line));
+                free(line);
+            }
+        }
+        free(tmp);
+        if (rc != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* All-digits decimal parse of an archive suffix (`<sink>.<us>`); rejects e.g.
+ * `.pending`. 0 and *out set on success, -1 otherwise. */
+static int arch_suffix_value(const char *s, unsigned long long *out) {
+    if (s == NULL || s[0] == '\0') {
+        return -1;
+    }
+    for (const char *c = s; *c != '\0'; c++) {
+        if (*c < '0' || *c > '9') {
+            return -1;
+        }
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno == ERANGE || *end != '\0') {
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+typedef struct {
+    char name[256];            /* directory-relative archive file name */
+    unsigned long long suffix; /* the .<us> rotation timestamp (sort key) */
+    unsigned long long size;
+} archive_ent;
+
+static int archive_cmp(const void *pa, const void *pb) {
+    const archive_ent *a = pa;
+    const archive_ent *b = pb;
+    if (a->suffix < b->suffix) {
+        return -1;
+    }
+    return a->suffix > b->suffix ? 1 : 0;
+}
+
+/* Retention: keep total on-disk audit bounded by BOTH a segment count and a
+ * total byte budget (the active segment counts toward the bytes). Deletes the
+ * oldest archives first until within both bounds. This never risks an
+ * unresolved intent: carry-forward rotation re-materialises every open intent
+ * as a checkpoint in the (retained) active segment, so an archive only ever
+ * holds closed records or superseded checkpoints. Best-effort housekeeping;
+ * a failure just leaves more on disk. Must run only after the new segment is
+ * durably in place (see rotate). */
+static void apply_retention(rab_broker *b) {
+    if (b->cfg.retain_segments == 0 && b->cfg.retain_bytes == 0) {
+        return; /* both unlimited */
+    }
+    const char *slash = strrchr(b->path, '/');
+    char dirbuf[PATH_MAX];
+    const char *dir;
+    const char *base;
+    if (slash == NULL) {
+        dir = ".";
+        base = b->path;
+    } else {
+        size_t dl = (size_t) (slash - b->path);
+        if (dl >= sizeof dirbuf) {
+            return;
+        }
+        memcpy(dirbuf, b->path, dl);
+        dirbuf[dl] = '\0';
+        dir = dirbuf[0] != '\0' ? dirbuf : "/";
+        base = slash + 1;
+    }
+    size_t baselen = strlen(base);
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        return;
+    }
+    archive_ent *ents = NULL;
+    size_t n = 0, cap = 0;
+    unsigned long long total = b->seg_bytes; /* active segment counts */
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, base, baselen) != 0 ||
+            e->d_name[baselen] != '.') {
+            continue;
+        }
+        unsigned long long sv;
+        if (arch_suffix_value(e->d_name + baselen + 1, &sv) != 0) {
+            continue; /* not an archive (e.g. .pending) */
+        }
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof full, "%s/%s", dir, e->d_name) >=
+            (int) sizeof full) {
+            continue;
+        }
+        struct stat st;
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2 : 16;
+            archive_ent *tmp = realloc(ents, ncap * sizeof *tmp);
+            if (tmp == NULL) {
+                free(ents);
+                closedir(d);
+                return;
+            }
+            ents = tmp;
+            cap = ncap;
+        }
+        snprintf(ents[n].name, sizeof ents[n].name, "%s", e->d_name);
+        ents[n].suffix = sv;
+        ents[n].size = (unsigned long long) st.st_size;
+        total += ents[n].size;
+        n++;
+    }
+    closedir(d);
+    if (n == 0) {
+        free(ents);
+        return;
+    }
+    qsort(ents, n, sizeof *ents, archive_cmp); /* oldest first */
+    size_t archives = n;
+    int pruned = 0;
+    for (size_t i = 0; i < n; i++) {
+        int over_count = b->cfg.retain_segments != 0 &&
+                         archives > b->cfg.retain_segments;
+        int over_bytes =
+            b->cfg.retain_bytes != 0 && total > b->cfg.retain_bytes;
+        if (!over_count && !over_bytes) {
+            break;
+        }
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof full, "%s/%s", dir, ents[i].name) >=
+            (int) sizeof full) {
+            continue;
+        }
+        if (unlink(full) == 0) {
+            archives--;
+            total -= ents[i].size;
+            pruned = 1;
+        }
+    }
+    free(ents);
+    if (pruned) {
+        rab_fsync_parent_dir(b->path); /* make the deletions durable */
+    }
+}
+
 /* Carry-forward rotation: write every open intent as a checkpoint into a new
- * segment, fsync it, hardlink the old segment to an archive name (preserving
- * history), then atomically swap the new segment into place. Ordering
- * guarantees no open intent is lost across a crash: the current path is never
- * absent, and a stray `.pending` from a crash is discarded at startup (the
- * live path is always the authoritative superset). Best-effort: on any failure
- * the current segment stays valid and rotation retries on the next append. */
+ * segment, carry the per-uid rate history, fsync it, hardlink the old segment
+ * to an archive name (preserving history), then atomically swap the new segment
+ * into place. Ordering guarantees no open intent is lost across a crash: the
+ * current path is never absent, and a stray `.pending` from a crash is
+ * discarded at startup (the live path is always the authoritative superset).
+ * Retention prunes old archives only after the new segment is durable.
+ * Best-effort: on any failure the current segment stays valid and rotation
+ * retries on the next append. */
 static int rotate(rab_broker *b) {
     char pending[PATH_MAX];
     if (snprintf(pending, sizeof pending, "%s.pending", b->path) >=
@@ -280,6 +475,12 @@ static int rotate(rab_broker *b) {
         free(line);
     }
     if (rc != 0) {
+        close(pfd);
+        unlink(pending);
+        return -1;
+    }
+    /* carry the per-uid rate history into the new segment (see note above) */
+    if (write_rate_carries(b, pfd) != 0) {
         close(pfd);
         unlink(pending);
         return -1;
@@ -328,6 +529,13 @@ static int rotate(rab_broker *b) {
     struct stat st;
     b->seg_bytes =
         (fstat(pfd, &st) == 0) ? (unsigned long long) st.st_size : 0;
+    /* Prune old archives ONLY now that the new segment is durably in place: the
+     * checkpoints that keep every open intent alive are fsync'd and swapped in
+     * before any archive can be deleted. Skip when poisoned (durability is
+     * uncertain; keep everything). */
+    if (!b->poisoned) {
+        apply_retention(b);
+    }
     return b->poisoned ? -1 : 0;
 }
 
@@ -722,16 +930,28 @@ static int reconstruct(rab_broker *b, const char **err) {
                 rc = -1;
                 break;
             }
-            const char *e = apply_stored(b, &s, &closed);
-            if (e != NULL) {
-                *err = e;
-                rc = -1;
-                break;
-            }
-            /* rate windows rebuild from client ops (audit records), not from
-             * broker-generated checkpoints. */
-            if (s.type == RAB_REC_AUDIT) {
-                rate_note(b, s.actor.uid, s.time_us);
+            if (s.type == RAB_REC_RATE) {
+                /* per-uid rate history carried across a rotation: reseed the
+                 * ring so the limit survives a restart (the audit records that
+                 * seeded it are in an archive we do not read). */
+                for (size_t i = 0; i < s.rate_n; i++) {
+                    rate_note(b, s.rate_uid, s.rate_times[i]);
+                }
+                rab_stored_free(&s);
+            } else {
+                const char *e = apply_stored(b, &s, &closed);
+                if (e != NULL) {
+                    *err = e;
+                    rc = -1;
+                    rab_stored_free(&s);
+                    break;
+                }
+                /* rate windows rebuild from client ops (audit records), not from
+                 * broker-generated checkpoints. */
+                if (s.type == RAB_REC_AUDIT) {
+                    rate_note(b, s.actor.uid, s.time_us);
+                }
+                rab_stored_free(&s);
             }
         }
         p = nl + 1;

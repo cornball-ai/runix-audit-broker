@@ -242,6 +242,8 @@ static void craft_checkpoint(FILE *f, const char *cid, const char *binding,
 
 /* ---- tests ------------------------------------------------------------- */
 
+static int parses_ok(const char *s); /* defined below; used by rate-parse tests */
+
 static void test_record_schema(void) {
     rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
     a.gid = 1000;
@@ -325,12 +327,87 @@ static void test_record_schema(void) {
     CHECK(strcmp(s.scope, "system") == 0, "checkpoint scope");
     CHECK(s.actor.uid == 1000 && s.actor.pid == 4321, "checkpoint peer");
     CHECK(s.time_us == 1786238615572863ull, "checkpoint accepted_time_us");
+    rab_stored_free(&s);
     free(line);
+}
+
+/* Build a broker_rate carry record, round-trip it, and check strict rejection
+ * of malformed variants. */
+static void test_rate_record_parse(void) {
+    unsigned long long times[] = {1700000000000000ull, 1700000000000005ull};
+    char *line = rab_build_rate(1000, times, 2);
+    CHECK(line != NULL, "rate record built");
+    if (line != NULL) {
+        rab_stored s;
+        CHECK(rab_parse_stored(line, strlen(line), &s) == 0, "rate record parses");
+        CHECK(s.type == RAB_REC_RATE, "parsed as rate");
+        CHECK(s.rate_uid == 1000, "rate uid");
+        CHECK(s.rate_n == 2, "rate count");
+        CHECK(s.rate_times != NULL && s.rate_times[0] == times[0] &&
+                  s.rate_times[1] == times[1],
+              "rate timestamps round-trip");
+        rab_stored_free(&s);
+        free(line);
+    }
+
+    /* strict: non-string / non-decimal timestamps, extra keys, negative uid */
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
+                     "\"uid\":1000,\"times_us\":[123]}"),
+          "non-string rate timestamp rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
+                     "\"uid\":1000,\"times_us\":[\"12x\"]}"),
+          "non-decimal rate timestamp rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
+                     "\"uid\":1000,\"times_us\":[],\"x\":1}"),
+          "extra key on rate record rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
+                     "\"uid\":-1,\"times_us\":[]}"),
+          "negative uid on rate record rejected");
+    /* an empty carry is well-formed (a uid with no in-window history) */
+    CHECK(parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
+                    "\"uid\":1000,\"times_us\":[]}"),
+          "empty rate carry accepted");
+}
+
+/* Count archived segments (<base>.<all-digits>) in dir. -1 if dir unreadable. */
+static int count_archives(const char *dir, const char *base) {
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        return -1;
+    }
+    size_t bl = strlen(base);
+    int c = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, base, bl) != 0 || e->d_name[bl] != '.') {
+            continue;
+        }
+        const char *suf = e->d_name + bl + 1;
+        if (suf[0] == '\0') {
+            continue;
+        }
+        int digits = 1;
+        for (const char *p = suf; *p != '\0'; p++) {
+            if (*p < '0' || *p > '9') {
+                digits = 0;
+                break;
+            }
+        }
+        if (digits) {
+            c++;
+        }
+    }
+    closedir(d);
+    return c;
 }
 
 static int parses_ok(const char *s) {
     rab_stored st;
-    return rab_parse_stored(s, strlen(s), &st) == 0;
+    int rc = rab_parse_stored(s, strlen(s), &st);
+    if (rc == 0) {
+        rab_stored_free(&st); /* release a rate record's carried timestamps */
+    }
+    return rc == 0;
 }
 
 static void test_strict_parsing(void) {
@@ -1002,8 +1079,153 @@ static void test_rate_limit_survives_restart(void) {
     cleanup_dir(dir);
 }
 
+/* Requirement 4: rotation -> idle exit -> restart resets NEITHER the open-intent
+ * set NOR the per-uid rate limit. Small rotate_bytes forces the rate-seeding
+ * audit records into archives (which reconstruction never reads), so only the
+ * carried rate history keeps the limit alive across the restart. */
+static void test_rate_carry_survives_rotation(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rate_max_in_window = 3;
+    cfg.rate_window_sec = 100;
+    cfg.max_open_per_uid = 100; /* don't let the open cap interfere */
+    cfg.rotate_bytes = 256;     /* each op rotates: seeders move to archives */
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+
+    unsigned long long base = 2500000000000000ull;
+    unsigned long long window_us = (unsigned long long) cfg.rate_window_sec * 1000000ull;
+    g_now = base;
+    g_step = 1; /* advance so archive suffixes are distinct across rotations */
+
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (rate carry)");
+    char bind[3][RAB_BINDING_STR_MAX], cid[3][RAB_CID_MAX];
+    CHECK(strcmp(do_open(b, &a, bind[0], cid[0]), "OK") == 0, "carry open 1");
+    CHECK(strcmp(do_open(b, &a, bind[1], cid[1]), "OK") == 0, "carry open 2");
+    CHECK(strcmp(do_open(b, &a, bind[2], cid[2]), "OK") == 0, "carry open 3");
+    CHECK(strcmp(do_open(b, &a, bind[0], cid[0]), "rate_limited") == 0,
+          "fourth op rate-limited before restart");
+    CHECK(rab_broker_open_count(b) == 3, "three intents open before restart");
+    /* rotation must have happened, moving the seeder audit records to archives */
+    CHECK(count_archives(dir, "audit.jsonl") >= 1, "rotation produced archives");
+    rab_broker_close(b);
+
+    /* restart still inside the window: open intents AND the rate limit persist */
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "reopen (rate carry, in window)");
+    CHECK(rab_broker_open_count(b) == 3, "open intents survived rotation+restart");
+    CHECK(rab_broker_has_open(b, cid[0]) && rab_broker_has_open(b, cid[1]) &&
+              rab_broker_has_open(b, cid[2]),
+          "exact intents survived");
+    CHECK(strcmp(do_open(b, &a, bind[0], cid[0]), "rate_limited") == 0,
+          "per-uid rate limit survived rotation+restart");
+    rab_broker_close(b);
+
+    /* restart well past the window: the carried timestamps age out, ops allowed */
+    g_now = base + window_us + 1000000ull;
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "reopen (rate carry, after window)");
+    char nb[RAB_BINDING_STR_MAX], nc[RAB_CID_MAX];
+    CHECK(strcmp(do_open(b, &a, nb, nc), "OK") == 0,
+          "ops allowed once the carried window elapses");
+    rab_broker_close(b);
+    g_step = 1;
+    g_now = 1700000000000000ull;
+    cleanup_dir(dir);
+}
+
+/* Requirement 3 + 5: retention bounds total on-disk audit by BOTH segment count
+ * and total bytes, and never discards an unresolved intent (carry-forward keeps
+ * every open intent in the retained active segment). */
+static void test_retention_bounds(void) {
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    const char *err = NULL;
+
+    /* --- segment-count retention --- */
+    {
+        char dir[256], path[512];
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_config cfg;
+        rab_config_defaults(&cfg);
+        cfg.rotate_bytes = 256;  /* rotate on every op */
+        cfg.retain_segments = 2; /* keep at most 2 archives */
+        cfg.retain_bytes = 0;    /* count-only here */
+        g_step = 2;              /* distinct archive suffixes */
+
+        rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "broker open (count retention)");
+        char keep_bind[RAB_BINDING_STR_MAX], keep_cid[RAB_CID_MAX];
+        CHECK(strcmp(do_open(b, &a, keep_bind, keep_cid), "OK") == 0,
+              "unresolved intent opened");
+        int emits_ok = 1;
+        for (int i = 0; i < 8; i++) {
+            if (strcmp(do_emit(b, &a, "preview", NULL), "OK") != 0) {
+                emits_ok = 0;
+            }
+        }
+        CHECK(emits_ok, "emits across many rotations succeed");
+        CHECK(count_archives(dir, "audit.jsonl") >= 1, "rotation happened");
+        CHECK(count_archives(dir, "audit.jsonl") <= 2,
+              "archive count held at the retention bound");
+        rab_broker_close(b);
+
+        b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "reopen after count pruning");
+        CHECK(rab_broker_open_count(b) == 1,
+              "unresolved intent survived count pruning");
+        CHECK(rab_broker_has_open(b, keep_cid), "the exact intent survived");
+        CHECK(strcmp(do_outcome(b, &a, keep_bind), "OK") == 0,
+              "survived intent still closable");
+        rab_broker_close(b);
+        cleanup_dir(dir);
+    }
+
+    /* --- total-byte retention (active segment counts toward the budget) --- */
+    {
+        char dir[256], path[512];
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_config cfg;
+        rab_config_defaults(&cfg);
+        cfg.rotate_bytes = 256;
+        cfg.retain_segments = 0; /* count unlimited */
+        cfg.retain_bytes = 100;  /* below one record: the active seg alone exceeds it */
+        g_step = 2;
+
+        rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "broker open (byte retention)");
+        char kb[RAB_BINDING_STR_MAX], kc[RAB_CID_MAX];
+        CHECK(strcmp(do_open(b, &a, kb, kc), "OK") == 0, "unresolved intent opened");
+        int emits_ok = 1;
+        for (int i = 0; i < 6; i++) {
+            if (strcmp(do_emit(b, &a, "preview", NULL), "OK") != 0) {
+                emits_ok = 0;
+            }
+        }
+        CHECK(emits_ok, "emits (byte retention) succeed");
+        CHECK(count_archives(dir, "audit.jsonl") == 0,
+              "a byte budget below the active size prunes all archives");
+        rab_broker_close(b);
+
+        b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "reopen after byte pruning");
+        CHECK(rab_broker_open_count(b) == 1,
+              "unresolved intent survived byte pruning");
+        CHECK(rab_broker_has_open(b, kc), "the exact intent survived");
+        rab_broker_close(b);
+        cleanup_dir(dir);
+    }
+    g_step = 1;
+}
+
 int main(void) {
     test_record_schema();
+    test_rate_record_parse();
     test_cross_sink_schema();
     test_strict_parsing();
     test_lifecycle_and_reconstruction();
@@ -1016,6 +1238,8 @@ int main(void) {
     test_rotation_preserves_open_intents();
     test_bounded_open_intents();
     test_rate_limit_survives_restart();
+    test_rate_carry_survives_rotation();
+    test_retention_bounds();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

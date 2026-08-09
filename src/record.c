@@ -155,6 +155,47 @@ char *rab_build_checkpoint(const char *correlation_id, const char *binding,
     return s;
 }
 
+char *rab_build_rate(uid_t uid, const unsigned long long *times, size_t n) {
+    json_t *root = json_object();
+    json_t *arr = json_array();
+    if (root == NULL || arr == NULL) {
+        json_decref(root);
+        json_decref(arr);
+        return NULL;
+    }
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        char ts[24];
+        snprintf(ts, sizeof ts, "%llu", times[i]);
+        bad |= json_array_append_new(arr, json_string(ts));
+    }
+    /* insertion order: schema_version, record_type, uid, times_us */
+    bad |= json_object_set_new(root, "schema_version", json_integer(1));
+    bad |= json_object_set_new(root, "record_type", json_string("broker_rate"));
+    bad |= json_object_set_new(root, "uid", json_integer((json_int_t) uid));
+    if (!bad) {
+        bad |= json_object_set_new(root, "times_us", arr); /* steals arr */
+    } else {
+        json_decref(arr);
+    }
+    if (bad) {
+        json_decref(root);
+        return NULL;
+    }
+    char *s = json_dumps(root, JSON_COMPACT);
+    json_decref(root);
+    return s;
+}
+
+void rab_stored_free(rab_stored *out) {
+    if (out == NULL) {
+        return;
+    }
+    free(out->rate_times);
+    out->rate_times = NULL;
+    out->rate_n = 0;
+}
+
 /* ---- parse-back for reconstruction ------------------------------------- */
 
 /* Reject an object with any key outside the allowed set (exact validation). */
@@ -281,6 +322,45 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
         out->type = RAB_REC_AUDIT;
     } else if (strcmp(rts, "broker_checkpoint") == 0) {
         out->type = RAB_REC_CHECKPOINT;
+    } else if (strcmp(rts, "broker_rate") == 0) {
+        /* broker-internal per-uid rate carry: a fixed, self-contained shape
+         * with no correlation id and no broker extension. Validated exactly and
+         * handled here in full (it is not an open/close event). */
+        static const char *const rk[] = {"schema_version", "record_type", "uid",
+                                         "times_us"};
+        if (!obj_only_keys(root, rk, 4)) {
+            goto done;
+        }
+        json_t *juid = json_object_get(root, "uid");
+        if (!json_is_integer(juid) || json_integer_value(juid) < 0) {
+            goto done;
+        }
+        json_t *arr = json_object_get(root, "times_us");
+        if (!json_is_array(arr)) {
+            goto done;
+        }
+        size_t n = json_array_size(arr);
+        unsigned long long *times = NULL;
+        if (n > 0) {
+            times = malloc(n * sizeof *times);
+            if (times == NULL) {
+                goto done;
+            }
+            for (size_t i = 0; i < n; i++) {
+                json_t *el = json_array_get(arr, i);
+                if (!json_is_string(el) ||
+                    parse_u64_strict(json_string_value(el), &times[i]) != 0) {
+                    free(times);
+                    goto done;
+                }
+            }
+        }
+        out->type = RAB_REC_RATE;
+        out->rate_uid = (uid_t) json_integer_value(juid);
+        out->rate_times = times;
+        out->rate_n = n;
+        rc = 0;
+        goto done;
     } else {
         goto done; /* unknown record_type: fail closed */
     }

@@ -18,6 +18,8 @@ typedef struct {
     unsigned rate_max_in_window;     /* max appended records/uid/window (0=off) */
     unsigned long long rotate_bytes; /* rotate segment past this (0=never) */
     unsigned long long min_free_bytes; /* refuse appends below this fs free (0=off) */
+    unsigned retain_segments;        /* max archived segments to keep (0=unlimited) */
+    unsigned long long retain_bytes; /* max total bytes, active+archives (0=unlimited) */
 } rab_config;
 
 void rab_config_defaults(rab_config *cfg);
