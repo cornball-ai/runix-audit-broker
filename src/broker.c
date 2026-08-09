@@ -410,6 +410,13 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
     }
     rate_note(b, actor->uid, now);
     maybe_rotate(b);
+    if (b->poisoned) {
+        /* rotation left the segment's durability uncertain: do not hand back a
+         * success the caller would act on. */
+        return reply(resp, rab_response_error(
+                               "persist_failed",
+                               "audit durability uncertain after rotation"));
+    }
     return reply(resp, rab_response_open_ok(cid, binding, "system"));
 }
 
@@ -448,6 +455,11 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
     open_remove(b, it); /* single-use: the outcome closes the intent */
     rate_note(b, actor->uid, now);
     maybe_rotate(b);
+    if (b->poisoned) {
+        return reply(resp, rab_response_error(
+                               "persist_failed",
+                               "audit durability uncertain after rotation"));
+    }
     return reply(resp, rab_response_outcome_ok());
 }
 

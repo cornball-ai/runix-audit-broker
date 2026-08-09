@@ -282,6 +282,126 @@ static void test_record_schema(void) {
     free(line);
 }
 
+static int parses_ok(const char *s) {
+    rab_stored st;
+    return rab_parse_stored(s, strlen(s), &st) == 0;
+}
+
+static void test_strict_parsing(void) {
+    /* a well-formed intent record (baseline: must parse) */
+    const char *ok =
+        "{\"schema_version\":1,\"record_type\":\"audit\",\"correlation_id\":"
+        "\"c1\",\"phase\":\"intent\",\"host\":\"h\",\"pid\":4321,\"actor\":"
+        "\"uid:1000\",\"operation\":\"op\",\"outcome\":\"intent\",\"time\":"
+        "\"2026-01-01T00:00:00Z\",\"broker\":{\"schema_version\":1,\"peer\":"
+        "{\"uid\":1000,\"gid\":1000,\"pid\":4321,\"boot_id\":\"b\","
+        "\"starttime\":\"555\"},\"binding\":\"bind1\",\"accepted_time_us\":"
+        "\"1700000000000000\"}}";
+    CHECK(parses_ok(ok), "valid intent parses");
+
+    /* unknown record_type: no silent audit fall-through */
+    CHECK(!parses_ok(
+              "{\"schema_version\":1,\"record_type\":\"bogus\","
+              "\"correlation_id\":\"c1\",\"phase\":\"intent\",\"host\":\"h\","
+              "\"pid\":4321,\"actor\":\"uid:1000\",\"operation\":\"op\","
+              "\"outcome\":\"intent\",\"time\":\"t\",\"broker\":{"
+              "\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,"
+              "\"pid\":4321,\"boot_id\":\"b\",\"starttime\":\"555\"},"
+              "\"binding\":\"x\",\"accepted_time_us\":\"1\"}}"),
+          "unknown record_type rejected");
+
+    /* missing record_type is rejected (strict recovery path) */
+    CHECK(!parses_ok(
+              "{\"schema_version\":1,\"correlation_id\":\"c1\",\"phase\":"
+              "\"intent\",\"host\":\"h\",\"pid\":4321,\"actor\":\"uid:1000\","
+              "\"operation\":\"op\",\"time\":\"t\",\"broker\":{"
+              "\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,"
+              "\"pid\":4321,\"boot_id\":\"b\",\"starttime\":\"555\"},"
+              "\"binding\":\"x\",\"accepted_time_us\":\"1\"}}"),
+          "missing record_type rejected");
+
+    /* unknown top-level schema_version */
+    CHECK(!parses_ok(
+              "{\"schema_version\":2,\"record_type\":\"audit\","
+              "\"correlation_id\":\"c1\",\"phase\":\"intent\",\"host\":\"h\","
+              "\"pid\":4321,\"actor\":\"uid:1000\",\"operation\":\"op\","
+              "\"time\":\"t\",\"broker\":{\"schema_version\":1,\"peer\":{"
+              "\"uid\":1000,\"gid\":1000,\"pid\":4321,\"boot_id\":\"b\","
+              "\"starttime\":\"555\"},\"binding\":\"x\","
+              "\"accepted_time_us\":\"1\"}}"),
+          "unknown schema_version rejected");
+
+/* helper: the baseline with the broker object replaced */
+#define WITHBROKER(b)                                                        \
+    "{\"schema_version\":1,\"record_type\":\"audit\",\"correlation_id\":"    \
+    "\"c1\",\"phase\":\"%s\",\"host\":\"h\",\"pid\":4321,\"actor\":"         \
+    "\"uid:1000\",\"operation\":\"op\",\"time\":\"t\",\"broker\":" b "}"
+
+    char buf[1024];
+    /* malformed accepted_time_us: trailing chars, empty, sign, non-digit */
+    const char *bad_ats[] = {
+        "{\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,\"pid\":"
+        "4321,\"boot_id\":\"b\",\"starttime\":\"555\"},\"binding\":\"x\","
+        "\"accepted_time_us\":\"123x\"}",
+        "{\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,\"pid\":"
+        "4321,\"boot_id\":\"b\",\"starttime\":\"555\"},\"binding\":\"x\","
+        "\"accepted_time_us\":\"\"}",
+        "{\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,\"pid\":"
+        "4321,\"boot_id\":\"b\",\"starttime\":\"555\"},\"binding\":\"x\","
+        "\"accepted_time_us\":\"-5\"}"};
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(buf, sizeof buf, WITHBROKER("%s"), "intent", bad_ats[i]);
+        CHECK(!parses_ok(buf), "malformed accepted_time_us rejected");
+    }
+
+    /* binding present on an outcome (must be intent-only) */
+    snprintf(buf, sizeof buf, WITHBROKER("%s"), "outcome",
+             "{\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,"
+             "\"pid\":4321,\"boot_id\":\"b\",\"starttime\":\"555\"},"
+             "\"binding\":\"x\",\"accepted_time_us\":\"1\"}");
+    CHECK(!parses_ok(buf), "binding on an outcome rejected");
+
+    /* intent without a binding */
+    snprintf(buf, sizeof buf, WITHBROKER("%s"), "intent",
+             "{\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,"
+             "\"pid\":4321,\"boot_id\":\"b\",\"starttime\":\"555\"},"
+             "\"accepted_time_us\":\"1\"}");
+    CHECK(!parses_ok(buf), "intent without a binding rejected");
+
+    /* unknown key in the broker extension / peer */
+    snprintf(buf, sizeof buf, WITHBROKER("%s"), "intent",
+             "{\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,"
+             "\"pid\":4321,\"boot_id\":\"b\",\"starttime\":\"555\"},"
+             "\"binding\":\"x\",\"accepted_time_us\":\"1\",\"foo\":1}");
+    CHECK(!parses_ok(buf), "unknown broker key rejected");
+    snprintf(buf, sizeof buf, WITHBROKER("%s"), "intent",
+             "{\"schema_version\":1,\"peer\":{\"uid\":1000,\"gid\":1000,"
+             "\"pid\":4321,\"boot_id\":\"b\",\"starttime\":\"555\",\"x\":1},"
+             "\"binding\":\"x\",\"accepted_time_us\":\"1\"}");
+    CHECK(!parses_ok(buf), "unknown peer key rejected");
+
+    /* top-level pid / actor inconsistent with broker.peer */
+    CHECK(!parses_ok(
+              "{\"schema_version\":1,\"record_type\":\"audit\","
+              "\"correlation_id\":\"c1\",\"phase\":\"intent\",\"host\":\"h\","
+              "\"pid\":9999,\"actor\":\"uid:1000\",\"operation\":\"op\","
+              "\"time\":\"t\",\"broker\":{\"schema_version\":1,\"peer\":{"
+              "\"uid\":1000,\"gid\":1000,\"pid\":4321,\"boot_id\":\"b\","
+              "\"starttime\":\"555\"},\"binding\":\"x\","
+              "\"accepted_time_us\":\"1\"}}"),
+          "top-level pid != peer.pid rejected");
+    CHECK(!parses_ok(
+              "{\"schema_version\":1,\"record_type\":\"audit\","
+              "\"correlation_id\":\"c1\",\"phase\":\"intent\",\"host\":\"h\","
+              "\"pid\":4321,\"actor\":\"uid:999\",\"operation\":\"op\","
+              "\"time\":\"t\",\"broker\":{\"schema_version\":1,\"peer\":{"
+              "\"uid\":1000,\"gid\":1000,\"pid\":4321,\"boot_id\":\"b\","
+              "\"starttime\":\"555\"},\"binding\":\"x\","
+              "\"accepted_time_us\":\"1\"}}"),
+          "actor != uid:peer.uid rejected");
+#undef WITHBROKER
+}
+
 static void test_lifecycle_and_reconstruction(void) {
     char dir[256], path[512];
     tmpdir(dir, sizeof dir);
@@ -684,6 +804,7 @@ static void test_rate_limit_survives_restart(void) {
 
 int main(void) {
     test_record_schema();
+    test_strict_parsing();
     test_lifecycle_and_reconstruction();
     test_identity_and_replay();
     test_reconstruction_fails_closed();
