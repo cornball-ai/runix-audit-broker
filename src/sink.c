@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 /* fsync the directory containing `path` so a create/rename is durable. */
-static int fsync_parent_dir(const char *path) {
+int rab_fsync_parent_dir(const char *path) {
     char *copy = strdup(path);
     if (copy == NULL) {
         return -1;
@@ -64,7 +64,7 @@ int rab_sink_open(const char *path) {
         return -1;
     }
 
-    if (created && fsync_parent_dir(path) != 0) {
+    if (created && rab_fsync_parent_dir(path) != 0) {
         close(fd);
         return -1;
     }

@@ -98,6 +98,27 @@ second `write_outcome` for the same intent is rejected (`unknown_intent`), so
 a replayed receipt cannot
 produce a duplicate or misattributed outcome.
 
+## Connection limits and deadlines
+
+The broker is a single-process, serialized loop, so a connection that stalls
+must not monopolize it:
+
+- **Absolute receive deadline.** A whole request frame must arrive within a
+  fixed monotonic budget measured from `accept(2)`. The deadline is **not**
+  reset by partial progress: a client dripping one byte at a time hits the same
+  wall-clock limit. On expiry the broker closes the connection (no reply is
+  guaranteed) and moves on.
+- **Bounded response-write deadline.** Writing the single response frame has
+  its own bounded deadline; a peer that refuses to read cannot wedge the loop.
+- **Connection caps.** Simultaneous plus pending connections are bounded (a
+  small listen backlog and an accepted-connection cap), and per-uid connection
+  attempts are rate-limited from broker-assigned timestamps. Exceeding either
+  is a closed connection, not a stalled broker.
+
+Deadlines are enforced with `poll(2)` against `CLOCK_MONOTONIC` remaining time.
+The sink path and these bounds are process configuration (CLI/env), never
+protocol input.
+
 ## Durability and disconnect
 
 - `open_intent` appends the intent and `fdatasync`s (and fsyncs the parent

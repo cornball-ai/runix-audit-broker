@@ -17,4 +17,8 @@ int rab_sink_open(const char *path);
  * `record` must contain no newline. Returns 0 on success, -1 on failure. */
 int rab_sink_append(int fd, const char *record, size_t len);
 
+/* fsync the directory containing `path` so a create/rename/unlink in it is
+ * durable. Returns 0 on success, -1 on failure. Used by rotation. */
+int rab_fsync_parent_dir(const char *path);
+
 #endif /* RAB_SINK_H */

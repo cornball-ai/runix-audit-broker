@@ -150,6 +150,71 @@ static void test_peer_cred(void) {
     close(sv[1]);
 }
 
+static void test_boot_id(void) {
+    char a[RAB_BOOT_ID_MAX];
+    char b[RAB_BOOT_ID_MAX];
+    CHECK(rab_boot_id(a, sizeof a) == 0, "boot_id read");
+    CHECK(strlen(a) > 0 && strlen(a) < RAB_BOOT_ID_MAX, "boot_id nonempty");
+    CHECK(strchr(a, '\n') == NULL, "boot_id newline stripped");
+    CHECK(rab_boot_id(b, sizeof b) == 0, "boot_id read again");
+    CHECK(strcmp(a, b) == 0, "boot_id stable within a boot");
+    char tiny[8];
+    CHECK(rab_boot_id(tiny, sizeof tiny) == -1, "boot_id fails on tiny buf");
+}
+
+static void test_proc_starttime(void) {
+    char a[RAB_STARTTIME_MAX];
+    char b[RAB_STARTTIME_MAX];
+    CHECK(rab_proc_starttime(getpid(), a, sizeof a) == 0, "starttime self");
+    CHECK(strlen(a) > 0, "starttime nonempty");
+    int all_digit = 1;
+    for (size_t i = 0; i < strlen(a); i++) {
+        if (a[i] < '0' || a[i] > '9') {
+            all_digit = 0;
+        }
+    }
+    CHECK(all_digit, "starttime is all digits");
+    CHECK(rab_proc_starttime(getpid(), b, sizeof b) == 0, "starttime again");
+    CHECK(strcmp(a, b) == 0, "starttime stable for a live pid");
+    /* PID 1 exists on any running system; its start time is readable. */
+    char one[RAB_STARTTIME_MAX];
+    CHECK(rab_proc_starttime(1, one, sizeof one) == 0, "starttime pid 1");
+    /* An almost-certainly-absent pid fails closed. */
+    char gone[RAB_STARTTIME_MAX];
+    CHECK(rab_proc_starttime(0x7ffffff0, gone, sizeof gone) == -1,
+          "starttime absent pid fails");
+    char tiny[4];
+    CHECK(rab_proc_starttime(getpid(), tiny, sizeof tiny) == -1,
+          "starttime fails on tiny buf");
+}
+
+static void test_peer_identity(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    rab_actor a;
+    CHECK(rab_peer_identity(sv[0], &a) == 0, "peer_identity ok");
+    CHECK(a.uid == getuid(), "identity uid matches caller");
+    CHECK(a.pid == getpid(), "identity pid matches caller");
+    CHECK(strlen(a.boot_id) > 0, "identity has boot_id");
+    CHECK(strlen(a.starttime) > 0, "identity has starttime");
+
+    /* self-equality and a mutated copy inequality */
+    rab_actor b = a;
+    CHECK(rab_actor_eq(&a, &b), "actor equals itself");
+    b.pid = a.pid + 1;
+    CHECK(!rab_actor_eq(&a, &b), "different pid is a different actor");
+    b = a;
+    b.starttime[0] = (b.starttime[0] == '9') ? '8' : '9';
+    CHECK(!rab_actor_eq(&a, &b),
+          "same pid different starttime is a different actor");
+    b = a;
+    b.boot_id[0] = (b.boot_id[0] == 'a') ? 'b' : 'a';
+    CHECK(!rab_actor_eq(&a, &b),
+          "different boot id is a different actor");
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_ids(void) {
     char a[RAB_CID_MAX];
     char b[RAB_CID_MAX];
@@ -186,6 +251,9 @@ int main(void) {
     test_sink_refuses_symlink();
     test_sink_refuses_world_writable();
     test_peer_cred();
+    test_boot_id();
+    test_proc_starttime();
+    test_peer_identity();
     test_ids();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
