@@ -119,20 +119,29 @@ produce a duplicate or misattributed outcome.
 
 ## Connection limits and deadlines
 
-The broker is a single-process, serialized loop, so a connection that stalls
-must not monopolize it:
+The broker is a single-process, non-blocking `poll(2)` reactor that multiplexes
+every connection concurrently. Each connection is an independent state machine
+(receive one request frame, then send one response frame), so a slow or stalled
+connection cannot monopolize the broker or delay another client waiting behind
+it. The broker's state mutation (append + fsync) stays serialized; only the
+network I/O is multiplexed.
 
 - **Absolute receive deadline.** A whole request frame must arrive within a
   fixed monotonic budget measured from `accept(2)`. The deadline is **not**
   reset by partial progress: a client dripping one byte at a time hits the same
   wall-clock limit. On expiry the broker closes the connection (no reply is
-  guaranteed) and moves on.
+  guaranteed) and reclaims the slot.
 - **Bounded response-write deadline.** Writing the single response frame has
-  its own bounded deadline; a peer that refuses to read cannot wedge the loop.
-- **Connection caps.** Simultaneous plus pending connections are bounded (a
-  small listen backlog and an accepted-connection cap), and per-uid connection
-  attempts are rate-limited from broker-assigned timestamps. Exceeding either
-  is a closed connection, not a stalled broker.
+  its own bounded absolute deadline; a peer that refuses to read is closed, not
+  allowed to hold a slot open.
+- **Connection caps.** Concurrent accepted connections are bounded globally and
+  **per-uid**, so one uid cannot occupy every slot and starve others; the listen
+  backlog bounds pending connections; and per-uid connection *attempts* are
+  rate-limited from broker-assigned timestamps. Exceeding any of these is a
+  closed connection, not a stalled broker.
+- **Bounded buffers.** Each connection holds at most one request body (capped at
+  the 64 KiB frame maximum) and one response buffer, so total memory is bounded
+  by the connection cap.
 
 Deadlines are enforced with `poll(2)` against `CLOCK_MONOTONIC` remaining time.
 The sink path and these bounds are process configuration (CLI/env), never

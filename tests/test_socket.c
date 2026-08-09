@@ -498,6 +498,113 @@ static void test_slowloris(void) {
     cleanup_dir(dir);
 }
 
+/* Blocker 5 acceptance: while one uid holds several slow connections, a second
+ * client completes within its deadline. With a long receive deadline this fails
+ * on a serialized one-connection-at-a-time loop (B would wait behind each slow
+ * connection's full deadline) and passes only with a multiplexed reactor. */
+static void test_fair_multiplexing(void) {
+    char dir[256], sock[320], sink[320];
+    tmpdir(dir, sizeof dir);
+    snprintf(sock, sizeof sock, "%s/sock", dir);
+    snprintf(sink, sizeof sink, "%s/audit.jsonl", dir);
+    /* long receive deadline: a serial loop would block ~5s per slow client */
+    pid_t pid = start_broker(sock, sink, 5000, 0);
+    CHECK(wait_for_socket(sock, 3000) == 0, "broker up (fairness)");
+
+    enum { NSLOW = 5 };
+    int slow[NSLOW];
+    int connected = 0;
+    for (int i = 0; i < NSLOW; i++) {
+        slow[i] = client_connect(sock);
+        if (slow[i] >= 0) {
+            unsigned char one = 1; /* a lone byte: an incomplete frame */
+            (void) !write(slow[i], &one, 1);
+            connected++;
+        }
+    }
+    CHECK(connected == NSLOW, "all slow connections established");
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    char *r = request(sock, OPEN_BODY);
+    long long took;
+    {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        took = (t1.tv_sec - t0.tv_sec) * 1000LL +
+               (t1.tv_nsec - t0.tv_nsec) / 1000000LL;
+    }
+    CHECK(r && resp_ok(r) == 1,
+          "second client served while a uid holds slow connections");
+    CHECK(took < 1000, "second client served promptly (multiplexed, not queued)");
+    free(r);
+
+    /* the slow connections were held concurrently, not drained serially: at
+     * least one is still open (well before its 5s deadline). */
+    int still_open = 0;
+    {
+        int fl = fcntl(slow[0], F_GETFL, 0);
+        fcntl(slow[0], F_SETFL, fl | O_NONBLOCK);
+        char buf[4];
+        ssize_t n = read(slow[0], buf, sizeof buf);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            still_open = 1;
+        }
+    }
+    CHECK(still_open, "slow connections held concurrently while B was served");
+
+    for (int i = 0; i < NSLOW; i++) {
+        if (slow[i] >= 0) {
+            close(slow[i]);
+        }
+    }
+    int exit_ok = 0;
+    stop_broker(pid, &exit_ok);
+    CHECK(exit_ok, "broker clean exit (fairness)");
+    cleanup_dir(dir);
+}
+
+/* A single uid cannot occupy unbounded slots: connections beyond its concurrency
+ * budget are dropped, so it cannot starve other uids of the global pool. */
+static void test_per_uid_concurrency_cap(void) {
+    char dir[256], sock[320], sink[320];
+    tmpdir(dir, sizeof dir);
+    snprintf(sock, sizeof sock, "%s/sock", dir);
+    snprintf(sink, sizeof sink, "%s/audit.jsonl", dir);
+    setenv("RAB_MAX_CONNS_PER_UID", "2", 1);
+    pid_t pid = start_broker(sock, sink, 5000, 0);
+    CHECK(wait_for_socket(sock, 3000) == 0, "broker up (per-uid cap)");
+
+    int slow[2];
+    for (int i = 0; i < 2; i++) {
+        slow[i] = client_connect(sock);
+        if (slow[i] >= 0) {
+            unsigned char one = 1;
+            (void) !write(slow[i], &one, 1);
+        }
+    }
+    CHECK(slow[0] >= 0 && slow[1] >= 0, "two slow connections established");
+    /* let the broker admit both before the third connects */
+    struct timespec s = {.tv_sec = 0, .tv_nsec = 150 * 1000000L};
+    nanosleep(&s, NULL);
+
+    char *r = request(sock, OPEN_BODY);
+    CHECK(r == NULL,
+          "a connection beyond the per-uid concurrency cap is dropped");
+    free(r);
+
+    for (int i = 0; i < 2; i++) {
+        if (slow[i] >= 0) {
+            close(slow[i]);
+        }
+    }
+    int exit_ok = 0;
+    stop_broker(pid, &exit_ok);
+    CHECK(exit_ok, "broker clean exit (per-uid cap)");
+    unsetenv("RAB_MAX_CONNS_PER_UID"); /* do not leak the cap into later tests */
+    cleanup_dir(dir);
+}
+
 static void test_concurrent_writers(void) {
     char dir[256], sock[320], sink[320];
     tmpdir(dir, sizeof dir);
@@ -640,9 +747,11 @@ int main(void) {
     test_payload_identity_ignored();
     test_malformed_frames();
     test_slowloris();
+    test_fair_multiplexing();
     test_concurrent_writers();
     test_disconnect_durability();
     test_conn_attempt_limit();
+    test_per_uid_concurrency_cap();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
