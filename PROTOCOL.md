@@ -49,7 +49,9 @@ Exactly two `type`s. Any other is `unknown_request`.
   present, correct types, integers in range, **no** unexpected fields,
   bounded nesting depth.
 - Any `actor`/identity field in `record` is **ignored**: the broker stamps the
-  actor from `SO_PEERCRED` (uid/gid/pid) over anything the payload claims.
+  full peer identity from `SO_PEERCRED` (uid/gid/pid) plus the boot id and the
+  peer's process start time (for PID-reuse safety) over anything the payload
+  claims.
 - The broker mints `correlation_id`, `schema_version`, `host`, `pid`, `time`,
   and the `phase` (`intent`/`outcome`); a client cannot set them.
 
@@ -84,12 +86,16 @@ Error codes (closed set; deterministic per input):
 
 ## The receipt binding
 
-`binding` is an opaque, broker-issued token. It authorizes **nothing**: it
-cannot cause a mutation, cannot write to a different intent, and is
-meaningless to the client beyond echoing it back on `write_outcome`. The
-broker uses it only to match an outcome to its intent and to confirm the same
-`SO_PEERCRED` actor. It is **single-use**: a second `write_outcome` for the
-same intent is rejected (`unknown_intent`), so a replayed receipt cannot
+`binding` is an opaque, broker-issued token that authorizes exactly **one
+narrowly-scoped action**: appending the outcome for *its own* intent. It
+cannot cause a mutation, cannot write to a different intent, and possession
+alone is insufficient (the full peer identity must still match). It is
+**sensitive**: the broker stores it in the root-only sink because
+actor-matching is the real gate, and it is excluded from any
+forwarding/export view. The broker uses it only to match an outcome to its
+intent and to confirm the same full peer identity. It is **single-use**: a
+second `write_outcome` for the same intent is rejected (`unknown_intent`), so
+a replayed receipt cannot
 produce a duplicate or misattributed outcome.
 
 ## Durability and disconnect
@@ -102,7 +108,8 @@ produce a duplicate or misattributed outcome.
 
 ## Identity and paths
 
-- The actor is `SO_PEERCRED` (`uid`, `gid`, `pid`), kernel-verified, and is
+- The actor is the full `SO_PEERCRED` identity (`uid`, `gid`, `pid`, plus boot
+  id and process start time), kernel-verified, and is
   the only identity the record carries.
 - The sink path is fixed in the broker's configuration. It is **never** a
   protocol input; a client cannot tell the broker where to write. A test-path
