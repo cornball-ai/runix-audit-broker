@@ -278,10 +278,18 @@ static void test_payload_identity_ignored(void) {
             json_error_t e;
             json_t *rec = json_loads(line, 0, &e);
             if (rec) {
+                /* the numeric identity lives in broker.peer.uid; the canonical
+                 * actor is the "uid:<n>" string. Both must be the caller. */
+                json_t *peer =
+                    json_object_get(json_object_get(rec, "broker"), "peer");
+                json_t *uid = json_object_get(peer, "uid");
                 json_t *actor = json_object_get(rec, "actor");
-                json_t *uid = json_object_get(actor, "uid");
+                char want[32];
+                snprintf(want, sizeof want, "uid:%ld", (long) getuid());
                 if (json_is_integer(uid) &&
-                    (uid_t) json_integer_value(uid) == getuid()) {
+                    (uid_t) json_integer_value(uid) == getuid() &&
+                    json_is_string(actor) &&
+                    strcmp(json_string_value(actor), want) == 0) {
                     matched_uid = 1;
                 }
                 json_decref(rec);

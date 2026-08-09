@@ -1,11 +1,15 @@
-/* Marshalling of the broker's own on-disk audit records: build a canonical
- * JSONL line from broker-stamped fields plus the client's schema-validated
- * domain content, and parse such a line back during startup reconstruction.
+/* Marshalling of the broker's on-disk records to the shared cross-sink schema
+ * (docs/durable-audit-contract.md): canonical audit fields in insertion order
+ * plus a single, versioned `broker` extension object. Also the broker-internal
+ * `broker_checkpoint` record (carry-forward of a still-open intent), and the
+ * parse-back used during startup reconstruction.
  *
- * A stored record carries broker-owned fields the client can never set
- * (`correlation_id`, `phase`, `actor`, `time`, `host`) merged with the client
- * `record` content. `phase` is one of "intent", "outcome", "carry_forward".
- * Only "intent" and "carry_forward" carry a `binding`. */
+ * Canonical audit line (insertion order): schema_version, record_type="audit",
+ * correlation_id, phase, host, pid (peer), actor ("uid:<n>"), <domain...>,
+ * time (RFC 3339 UTC), then the trailing `broker` extension. The `broker`
+ * object carries the full peer identity, the binding (intent records only,
+ * sensitive), and a string `accepted_time_us` used only for reconstruction and
+ * rate windows (the canonical human timestamp is `time`). */
 #ifndef RAB_RECORD_H
 #define RAB_RECORD_H
 
@@ -17,31 +21,48 @@
 
 #define RAB_PHASE_INTENT "intent"
 #define RAB_PHASE_OUTCOME "outcome"
-#define RAB_PHASE_CARRY "carry_forward"
 
-/* Build a canonical (compact, sorted-key) record line. `binding` may be NULL
- * for an outcome record. `client_record` is the schema-validated domain object
- * (borrowed); its keys are merged in and never collide with broker-owned keys
- * (the schema rejects broker-owned keys in client records). Returns a malloc'd
- * NUL-terminated string with no embedded newline (caller frees), or NULL. */
-char *rab_build_record(const char *phase, const char *correlation_id,
-                       const char *binding, const rab_actor *actor,
-                       const char *host, unsigned long long time_us,
-                       json_t *client_record);
+/* max stored open-intent metadata strings (operation/resource/scope) */
+#define RAB_META_MAX 128
+#define RAB_SCOPE_MAX 32
+
+/* Build a canonical "audit" record line. `binding` non-NULL only for intent
+ * records (it is sensitive and appears nowhere else). `client_record` is the
+ * schema-validated domain object (borrowed); its keys are merged in canonical
+ * position and never collide with broker-owned keys. Returns a malloc'd
+ * NUL-terminated line with no embedded newline (caller frees), or NULL. */
+char *rab_build_audit(const char *phase, const char *correlation_id,
+                      const char *binding, const rab_actor *actor,
+                      const char *host, unsigned long long time_us,
+                      json_t *client_record);
+
+/* Build a `broker_checkpoint` record line: a still-open intent carried forward
+ * during rotation, retaining its operation/resource/scope plus binding and
+ * peer identity so it stays meaningful after archives are pruned. Returns a
+ * malloc'd line or NULL. */
+char *rab_build_checkpoint(const char *correlation_id, const char *binding,
+                           const rab_actor *actor, unsigned long long time_us,
+                           const char *operation, const char *resource,
+                           const char *scope);
+
+typedef enum { RAB_REC_AUDIT, RAB_REC_CHECKPOINT } rab_rec_type;
 
 /* The broker-owned facts recovered from one stored line. */
 typedef struct {
-    char phase[16];
+    rab_rec_type type;
+    char phase[16];               /* audit only; "" for a checkpoint */
     char correlation_id[RAB_CID_MAX];
     char binding[RAB_BINDING_MAX]; /* "" if the record carried none */
-    rab_actor actor;
-    unsigned long long time_us;
+    rab_actor actor;              /* from broker.peer */
+    unsigned long long time_us;   /* from broker.accepted_time_us */
+    char operation[RAB_META_MAX]; /* open-intent metadata ("" if absent) */
+    char resource[RAB_META_MAX];
+    char scope[RAB_SCOPE_MAX];
 } rab_stored;
 
 /* Parse one stored line into *out. Returns 0 on a well-formed broker record,
- * -1 otherwise (the caller decides whether that is a torn tail or corruption).
- * Strict: duplicate keys, a missing/!string phase, a missing correlation id,
- * or a malformed actor all fail. */
+ * -1 otherwise. Strict: duplicate keys, a missing correlation id, a missing or
+ * malformed `broker` extension, or (for audit) a missing phase all fail. */
 int rab_parse_stored(const char *line, size_t len, rab_stored *out);
 
 #endif /* RAB_RECORD_H */

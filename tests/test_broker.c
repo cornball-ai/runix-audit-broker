@@ -176,16 +176,111 @@ static void craft_line(FILE *f, const char *phase, const char *cid,
                         json_string(strcmp(phase, RAB_PHASE_OUTCOME) == 0
                                         ? "ok"
                                         : "intent"));
-    char *line =
-        rab_build_record(phase, cid, binding, actor, "host", 1700000000000000ull,
-                         rec);
+    char *line = rab_build_audit(phase, cid, binding, actor, "host",
+                                 1700000000000000ull, rec);
     json_decref(rec);
     fputs(line, f);
     fputc('\n', f);
     free(line);
 }
 
+/* craft a broker_checkpoint line (carry-forward of a still-open intent). */
+static void craft_checkpoint(FILE *f, const char *cid, const char *binding,
+                             const rab_actor *actor) {
+    char *line = rab_build_checkpoint(cid, binding, actor, 1700000000000000ull,
+                                      "svc.restart", "nginx.service", "system");
+    fputs(line, f);
+    fputc('\n', f);
+    free(line);
+}
+
 /* ---- tests ------------------------------------------------------------- */
+
+static void test_record_schema(void) {
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    a.gid = 1000;
+
+    /* an intent audit record: canonical fields + versioned broker extension */
+    json_t *rec = json_object();
+    json_object_set_new(rec, "operation", json_string("systemd.restart"));
+    json_object_set_new(rec, "resource", json_string("cups.service"));
+    json_object_set_new(rec, "scope", json_string("system"));
+    json_object_set_new(rec, "outcome", json_string("intent"));
+    char *line = rab_build_audit(RAB_PHASE_INTENT, "cid1", "bind1", &a, "h",
+                                 1786238615572863ull, rec);
+    json_decref(rec);
+    CHECK(line != NULL, "intent record built");
+    json_error_t e;
+    json_t *r = json_loads(line, 0, &e);
+    CHECK(r != NULL, "intent record parses");
+    if (r) {
+        CHECK(json_integer_value(json_object_get(r, "schema_version")) == 1,
+              "schema_version 1");
+        CHECK(json_is_string(json_object_get(r, "record_type")) &&
+                  strcmp(json_string_value(json_object_get(r, "record_type")),
+                         "audit") == 0,
+              "record_type audit");
+        CHECK(json_is_string(json_object_get(r, "actor")) &&
+                  strcmp(json_string_value(json_object_get(r, "actor")),
+                         "uid:1000") == 0,
+              "actor is uid:1000 string");
+        CHECK(json_integer_value(json_object_get(r, "pid")) == 4321,
+              "top-level pid is the peer pid");
+        CHECK(json_is_string(json_object_get(r, "time")) &&
+                  strcmp(json_string_value(json_object_get(r, "time")),
+                         "2026-08-09T01:23:35Z") == 0,
+              "time is RFC 3339 UTC");
+        json_t *brk = json_object_get(r, "broker");
+        CHECK(json_is_object(brk), "broker extension present");
+        CHECK(json_integer_value(json_object_get(brk, "schema_version")) == 1,
+              "broker.schema_version 1");
+        json_t *peer = json_object_get(brk, "peer");
+        CHECK(json_integer_value(json_object_get(peer, "uid")) == 1000 &&
+                  json_integer_value(json_object_get(peer, "gid")) == 1000 &&
+                  json_integer_value(json_object_get(peer, "pid")) == 4321,
+              "broker.peer full numeric identity");
+        CHECK(json_is_string(json_object_get(peer, "boot_id")) &&
+                  json_is_string(json_object_get(peer, "starttime")),
+              "broker.peer boot_id + starttime");
+        CHECK(json_is_string(json_object_get(brk, "binding")),
+              "intent carries broker.binding");
+        CHECK(json_is_string(json_object_get(brk, "accepted_time_us")),
+              "accepted_time_us is a string");
+        json_decref(r);
+    }
+    free(line);
+
+    /* an outcome record must NOT carry the binding (sensitive, intent-only) */
+    json_t *orec = json_object();
+    json_object_set_new(orec, "operation", json_string("systemd.restart"));
+    json_object_set_new(orec, "outcome", json_string("ok"));
+    line = rab_build_audit(RAB_PHASE_OUTCOME, "cid1", NULL, &a, "h",
+                           1786238615572863ull, orec);
+    json_decref(orec);
+    r = json_loads(line, 0, &e);
+    CHECK(r != NULL && json_object_get(json_object_get(r, "broker"),
+                                       "binding") == NULL,
+          "outcome record has no broker.binding");
+    if (r) {
+        json_decref(r);
+    }
+    free(line);
+
+    /* round-trip a checkpoint: parse-back yields checkpoint type + metadata */
+    line = rab_build_checkpoint("cidc", "bindc", &a, 1786238615572863ull,
+                                "systemd.restart", "cups.service", "system");
+    rab_stored s;
+    CHECK(rab_parse_stored(line, strlen(line), &s) == 0, "checkpoint parses");
+    CHECK(s.type == RAB_REC_CHECKPOINT, "parsed as checkpoint");
+    CHECK(strcmp(s.correlation_id, "cidc") == 0, "checkpoint cid");
+    CHECK(strcmp(s.binding, "bindc") == 0, "checkpoint binding");
+    CHECK(strcmp(s.operation, "systemd.restart") == 0, "checkpoint operation");
+    CHECK(strcmp(s.resource, "cups.service") == 0, "checkpoint resource");
+    CHECK(strcmp(s.scope, "system") == 0, "checkpoint scope");
+    CHECK(s.actor.uid == 1000 && s.actor.pid == 4321, "checkpoint peer");
+    CHECK(s.time_us == 1786238615572863ull, "checkpoint accepted_time_us");
+    free(line);
+}
 
 static void test_lifecycle_and_reconstruction(void) {
     char dir[256], path[512];
@@ -442,8 +537,8 @@ static void test_carry_forward_idempotency(void) {
     /* two identical carry-forward checkpoints for one cid collapse to one open
      * intent (crash-during-rotation duplicate) and remain closable. */
     FILE *f = fopen(path, "w");
-    craft_line(f, RAB_PHASE_CARRY, "cid-cf", "bind-cf", &a);
-    craft_line(f, RAB_PHASE_CARRY, "cid-cf", "bind-cf", &a);
+    craft_checkpoint(f, "cid-cf", "bind-cf", &a);
+    craft_checkpoint(f, "cid-cf", "bind-cf", &a);
     fclose(f);
 
     rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
@@ -460,8 +555,8 @@ static void test_carry_forward_idempotency(void) {
     sink_path(dir2, path2, sizeof path2);
     rab_actor a2 = mk_actor(2000, 4321, "boot-abc", "555");
     f = fopen(path2, "w");
-    craft_line(f, RAB_PHASE_CARRY, "cid-cf", "bind-cf", &a);
-    craft_line(f, RAB_PHASE_CARRY, "cid-cf", "bind-cf", &a2);
+    craft_checkpoint(f, "cid-cf", "bind-cf", &a);
+    craft_checkpoint(f, "cid-cf", "bind-cf", &a2);
     fclose(f);
     err = NULL;
     rab_broker *b2 = rab_broker_open(path2, &cfg, test_clock, NULL, &err);
@@ -588,6 +683,7 @@ static void test_rate_limit_survives_restart(void) {
 }
 
 int main(void) {
+    test_record_schema();
     test_lifecycle_and_reconstruction();
     test_identity_and_replay();
     test_reconstruction_fails_closed();

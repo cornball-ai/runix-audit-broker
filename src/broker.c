@@ -26,6 +26,9 @@ typedef struct intent {
     char cid[RAB_CID_MAX];
     char binding[RAB_BINDING_MAX];
     rab_actor actor;
+    char operation[RAB_META_MAX]; /* retained so a checkpoint stays meaningful */
+    char resource[RAB_META_MAX];
+    char scope[RAB_SCOPE_MAX];
     struct intent *next;
 } intent;
 
@@ -172,7 +175,8 @@ static intent *open_find_cid(rab_broker *b, const char *cid) {
 }
 
 static int open_add(rab_broker *b, const char *cid, const char *binding,
-                    const rab_actor *actor) {
+                    const rab_actor *actor, const char *operation,
+                    const char *resource, const char *scope) {
     intent *it = calloc(1, sizeof *it);
     if (it == NULL) {
         return -1;
@@ -180,6 +184,9 @@ static int open_add(rab_broker *b, const char *cid, const char *binding,
     snprintf(it->cid, sizeof it->cid, "%s", cid);
     snprintf(it->binding, sizeof it->binding, "%s", binding);
     it->actor = *actor;
+    snprintf(it->operation, sizeof it->operation, "%s", operation ? operation : "");
+    snprintf(it->resource, sizeof it->resource, "%s", resource ? resource : "");
+    snprintf(it->scope, sizeof it->scope, "%s", scope ? scope : "");
     it->next = b->open;
     b->open = it;
     b->open_count++;
@@ -259,15 +266,10 @@ static int rotate(rab_broker *b) {
     }
     int rc = 0;
     for (intent *it = b->open; it != NULL && rc == 0; it = it->next) {
-        json_t *empty = json_object();
-        if (empty == NULL) {
-            rc = -1;
-            break;
-        }
         unsigned long long now = b->clock(b->clock_ctx);
-        char *line = rab_build_record(RAB_PHASE_CARRY, it->cid, it->binding,
-                                      &it->actor, b->host, now, empty);
-        json_decref(empty);
+        char *line = rab_build_checkpoint(it->cid, it->binding, &it->actor, now,
+                                          it->operation, it->resource,
+                                          it->scope);
         if (line == NULL) {
             rc = -1;
             break;
@@ -343,6 +345,16 @@ static int reply(char **resp, char *s) {
     return (s != NULL) ? 0 : -1;
 }
 
+/* Copy a string domain field from a client record into dst ("" if absent). */
+static void rec_str(json_t *record, const char *key, char *dst, size_t cap) {
+    json_t *v = json_object_get(record, key);
+    if (json_is_string(v)) {
+        snprintf(dst, cap, "%s", json_string_value(v));
+    } else {
+        dst[0] = '\0';
+    }
+}
+
 static int handle_open(rab_broker *b, const rab_actor *actor,
                        const rab_request *req, char **resp) {
     unsigned long long now = b->clock(b->clock_ctx);
@@ -372,8 +384,16 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
         rab_make_binding(binding, sizeof binding) != 0) {
         return reply(resp, rab_response_error("internal", "id minting failed"));
     }
-    char *line = rab_build_record(RAB_PHASE_INTENT, cid, binding, actor,
-                                  b->host, now, req->record);
+    /* retain the open-intent metadata so a later checkpoint stays meaningful */
+    char op[RAB_META_MAX];
+    char res[RAB_META_MAX];
+    char scope[RAB_SCOPE_MAX];
+    rec_str(req->record, "operation", op, sizeof op);
+    rec_str(req->record, "resource", res, sizeof res);
+    rec_str(req->record, "scope", scope, sizeof scope);
+
+    char *line = rab_build_audit(RAB_PHASE_INTENT, cid, binding, actor,
+                                 b->host, now, req->record);
     if (line == NULL) {
         return reply(resp, rab_response_error("internal", "record build"));
     }
@@ -383,7 +403,7 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
                      rab_response_error("persist_failed", "sink append failed"));
     }
     free(line);
-    if (open_add(b, cid, binding, actor) != 0) {
+    if (open_add(b, cid, binding, actor, op, res, scope) != 0) {
         /* the intent is durable (a queryable open op on restart) but this
          * instance cannot cache it; fail closed rather than lie. */
         return reply(resp, rab_response_error("internal", "open-set alloc"));
@@ -414,8 +434,8 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
         return reply(resp, rab_response_error("persist_failed",
                                               "insufficient free space"));
     }
-    char *line = rab_build_record(RAB_PHASE_OUTCOME, it->cid, NULL, actor,
-                                  b->host, now, req->record);
+    char *line = rab_build_audit(RAB_PHASE_OUTCOME, it->cid, NULL, actor,
+                                 b->host, now, req->record);
     if (line == NULL) {
         return reply(resp, rab_response_error("internal", "record build"));
     }
@@ -488,35 +508,39 @@ static void cid_free(cidnode *l) {
  * static error string on an inconsistency (fail closed). */
 static const char *apply_stored(rab_broker *b, const rab_stored *s,
                                 cidnode **closed) {
-    if (strcmp(s->phase, RAB_PHASE_INTENT) == 0 ||
-        strcmp(s->phase, RAB_PHASE_CARRY) == 0) {
+    /* An intent (audit) or a carry-forward (broker_checkpoint) opens the cid. */
+    int is_intent = (s->type == RAB_REC_AUDIT &&
+                     strcmp(s->phase, RAB_PHASE_INTENT) == 0);
+    int is_checkpoint = (s->type == RAB_REC_CHECKPOINT);
+    if (is_intent || is_checkpoint) {
         if (s->binding[0] == '\0') {
-            return "intent/carry-forward record without a binding";
+            return "intent/checkpoint record without a binding";
         }
         intent *it = open_find_cid(b, s->correlation_id);
         if (it != NULL) {
-            /* an already-open cid: only a carry-forward may repeat it, and
-             * only idempotently (identical binding + actor). */
-            if (strcmp(s->phase, RAB_PHASE_INTENT) == 0) {
+            /* an already-open cid: only a checkpoint may repeat it, and only
+             * idempotently (identical binding + actor). */
+            if (is_intent) {
                 return "inconsistent duplicate intent";
             }
             if (strcmp(it->binding, s->binding) != 0 ||
                 !rab_actor_eq(&it->actor, &s->actor)) {
-                return "inconsistent duplicate carry-forward";
+                return "inconsistent duplicate checkpoint";
             }
             return NULL; /* idempotent */
         }
         if (cid_in_list(*closed, s->correlation_id)) {
-            return (strcmp(s->phase, RAB_PHASE_INTENT) == 0)
-                       ? "duplicate intent for a closed operation"
-                       : "carry-forward of a closed operation";
+            return is_intent ? "duplicate intent for a closed operation"
+                             : "checkpoint of a closed operation";
         }
-        if (open_add(b, s->correlation_id, s->binding, &s->actor) != 0) {
+        if (open_add(b, s->correlation_id, s->binding, &s->actor, s->operation,
+                     s->resource, s->scope) != 0) {
             return "out of memory during reconstruction";
         }
         return NULL;
     }
-    if (strcmp(s->phase, RAB_PHASE_OUTCOME) == 0) {
+    if (s->type == RAB_REC_AUDIT &&
+        strcmp(s->phase, RAB_PHASE_OUTCOME) == 0) {
         intent *it = open_find_cid(b, s->correlation_id);
         if (it == NULL) {
             return cid_in_list(*closed, s->correlation_id)
@@ -529,7 +553,9 @@ static const char *apply_stored(rab_broker *b, const rab_stored *s,
         }
         return NULL;
     }
-    return "unknown record phase";
+    /* any other audit phase (e.g. a preview/noop emit) is a standalone closed
+     * record: it opens nothing and is not an open/close event. */
+    return NULL;
 }
 
 /* Read the whole current segment into *buf (malloc'd) / *total. Returns 0 on
@@ -644,9 +670,9 @@ static int reconstruct(rab_broker *b, const char **err) {
                 rc = -1;
                 break;
             }
-            /* rate windows rebuild from client ops (intent/outcome), not from
-             * broker-generated carry-forward checkpoints. */
-            if (strcmp(s.phase, RAB_PHASE_CARRY) != 0) {
+            /* rate windows rebuild from client ops (audit records), not from
+             * broker-generated checkpoints. */
+            if (s.type == RAB_REC_AUDIT) {
                 rate_note(b, s.actor.uid, s.time_us);
             }
         }
