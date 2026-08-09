@@ -217,6 +217,20 @@ static void test_end_to_end(void) {
         free(r2);
     }
 
+    /* an emit (single non-effect record) round-trips: ok + cid, no binding */
+    char *re = request(sock,
+                       "{\"type\":\"emit\",\"phase\":\"preview\",\"record\":"
+                       "{\"operation\":\"svc.restart\",\"outcome\":\"preview\","
+                       "\"effect_issued\":false}}");
+    CHECK(re != NULL && resp_ok(re) == 1, "emit ok over socket");
+    char *ecid = re ? resp_str(re, "correlation_id") : NULL;
+    char *ebind = re ? resp_str(re, "binding") : NULL;
+    CHECK(ecid != NULL, "emit returns a correlation id");
+    CHECK(ebind == NULL, "emit returns no binding");
+    free(ecid);
+    free(ebind);
+    free(re);
+
     int exit_ok = 0;
     stop_broker(pid, &exit_ok);
     CHECK(exit_ok, "broker exited cleanly (no ASan errors/leaks)");

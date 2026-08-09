@@ -167,7 +167,53 @@ static const char *do_outcome(rab_broker *b, const rab_actor *actor,
     return ret;
 }
 
-/* Append a raw crafted record line (built via rab_build_record) to a file. */
+/* Send an emit (single non-effect record); copy the minted cid out. Returns the
+ * response code, or "HAS_BINDING" if the response wrongly carried a binding. */
+static const char *do_emit(rab_broker *b, const rab_actor *actor,
+                           const char *phase, char *cid) {
+    char body[256];
+    snprintf(body, sizeof body,
+             "{\"type\":\"emit\",\"phase\":\"%s\",\"record\":{\"operation\":"
+             "\"svc.restart\",\"outcome\":\"%s\",\"effect_issued\":false}}",
+             phase, phase);
+    rab_request req;
+    const char *e = NULL;
+    if (rab_parse_request(body, strlen(body), &req, &e) != 0) {
+        return "PARSE_FAIL";
+    }
+    char *resp = NULL;
+    int rc = rab_broker_handle(b, actor, &req, &resp);
+    rab_request_free(&req);
+    if (rc != 0 || resp == NULL) {
+        return "HANDLE_FAIL";
+    }
+    static char code[32];
+    json_error_t je;
+    json_t *r = json_loads(resp, 0, &je);
+    free(resp);
+    if (r == NULL) {
+        return "RESP_PARSE_FAIL";
+    }
+    const char *ret = "OK";
+    if (json_is_true(json_object_get(r, "ok"))) {
+        json_t *jc = json_object_get(r, "correlation_id");
+        if (cid && json_is_string(jc)) {
+            snprintf(cid, RAB_CID_MAX, "%s", json_string_value(jc));
+        }
+        if (json_object_get(r, "binding") != NULL) {
+            ret = "HAS_BINDING";
+        }
+    } else {
+        json_t *err = json_object_get(r, "error");
+        snprintf(code, sizeof code, "%s",
+                 json_is_string(err) ? json_string_value(err) : "?");
+        ret = code;
+    }
+    json_decref(r);
+    return ret;
+}
+
+/* Append a raw crafted record line (built via rab_build_audit) to a file. */
 static void craft_line(FILE *f, const char *phase, const char *cid,
                        const char *binding, const rab_actor *actor) {
     json_t *rec = json_object();
@@ -811,6 +857,81 @@ static void test_rotation_preserves_open_intents(void) {
     cleanup_dir(dir);
 }
 
+static void test_emit(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (emit)");
+
+    char cid[RAB_CID_MAX] = {0};
+    CHECK(strcmp(do_emit(b, &a, "preview", cid), "OK") == 0, "emit preview ok");
+    CHECK(cid[0] != '\0', "emit returns a correlation id");
+    CHECK(rab_broker_open_count(b) == 0, "emit opens no intent");
+    CHECK(strcmp(do_emit(b, &a, "noop", NULL), "OK") == 0, "emit noop ok");
+    CHECK(rab_broker_open_count(b) == 0, "still nothing open after emit");
+    rab_broker_close(b);
+
+    /* restart: emit records are standalone; reconstruction opens nothing */
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL && rab_broker_open_count(b) == 0,
+          "emit records reconstruct as standalone (nothing open)");
+    /* an outcome cannot follow an emit: it minted no binding */
+    CHECK(strcmp(do_outcome(b, &a, cid), "unknown_intent") == 0,
+          "emit cannot be paired with a write_outcome");
+    rab_broker_close(b);
+
+    /* the emit record carries its phase and no broker.binding */
+    FILE *f = fopen(path, "r");
+    int preview_no_binding = 0;
+    if (f != NULL) {
+        char line[4096];
+        while (fgets(line, sizeof line, f)) {
+            json_error_t e;
+            json_t *r = json_loads(line, 0, &e);
+            if (r) {
+                json_t *ph = json_object_get(r, "phase");
+                json_t *brk = json_object_get(r, "broker");
+                if (json_is_string(ph) &&
+                    strcmp(json_string_value(ph), "preview") == 0 &&
+                    json_object_get(brk, "binding") == NULL) {
+                    preview_no_binding = 1;
+                }
+                json_decref(r);
+            }
+        }
+        fclose(f);
+    }
+    CHECK(preview_no_binding, "emit preview record has no broker.binding");
+    cleanup_dir(dir);
+
+    /* emit is rate-accounted like the effect paths */
+    char dir2[256], path2[512];
+    tmpdir(dir2, sizeof dir2);
+    sink_path(dir2, path2, sizeof path2);
+    rab_config cfg2;
+    rab_config_defaults(&cfg2);
+    cfg2.rate_max_in_window = 2;
+    cfg2.rate_window_sec = 100;
+    unsigned long long save_now = g_now, save_step = g_step;
+    g_step = 0;
+    g_now = 3000000000000000ull;
+    rab_broker *b2 = rab_broker_open(path2, &cfg2, test_clock, NULL, &err);
+    CHECK(b2 != NULL, "broker open (emit rate)");
+    CHECK(strcmp(do_emit(b2, &a, "preview", NULL), "OK") == 0, "emit rate 1");
+    CHECK(strcmp(do_emit(b2, &a, "preview", NULL), "OK") == 0, "emit rate 2");
+    CHECK(strcmp(do_emit(b2, &a, "preview", NULL), "rate_limited") == 0,
+          "emit beyond the rate window is rejected");
+    rab_broker_close(b2);
+    g_now = save_now;
+    g_step = save_step;
+    cleanup_dir(dir2);
+}
+
 static void test_bounded_open_intents(void) {
     char dir[256], path[512];
     tmpdir(dir, sizeof dir);
@@ -890,6 +1011,7 @@ int main(void) {
     test_reconstruction_fails_closed();
     test_partial_tail_recovery();
     test_free_space_refusal();
+    test_emit();
     test_carry_forward_idempotency();
     test_rotation_preserves_open_intents();
     test_bounded_open_intents();

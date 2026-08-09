@@ -52,6 +52,50 @@ int main(void) {
         rab_request_free(&req);
     }
 
+    /* --- emit: narrow non-effect path (preview/noop only) --- */
+    CHECK(strcmp(PARSE("{\"type\":\"emit\",\"phase\":\"preview\",\"record\":"
+                       "{\"operation\":\"x\",\"outcome\":\"preview\","
+                       "\"effect_issued\":false}}"), "OK") == 0,
+          "valid emit preview");
+    CHECK(strcmp(PARSE("{\"type\":\"emit\",\"phase\":\"noop\",\"record\":"
+                       "{\"operation\":\"x\",\"outcome\":\"noop\"}}"), "OK") == 0,
+          "valid emit noop");
+    /* phase is emit-extracted */
+    {
+        rab_request req;
+        const char *err = NULL;
+        const char *b = "{\"type\":\"emit\",\"phase\":\"preview\",\"record\":"
+                        "{\"operation\":\"x\",\"outcome\":\"preview\"}}";
+        CHECK(rab_parse_request(b, strlen(b), &req, &err) == 0, "parse emit");
+        CHECK(req.type == RAB_REQ_EMIT, "type is emit");
+        CHECK(strcmp(req.phase, "preview") == 0, "emit phase extracted");
+        CHECK(req.binding[0] == '\0', "emit carries no binding");
+        rab_request_free(&req);
+    }
+    /* emit only accepts preview/noop, never intent/outcome or arbitrary */
+    CHECK(strcmp(PARSE("{\"type\":\"emit\",\"phase\":\"outcome\",\"record\":"
+                       "{\"operation\":\"x\",\"outcome\":\"ok\"}}"),
+                 "schema_invalid") == 0, "emit phase outcome rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"emit\",\"phase\":\"intent\",\"record\":"
+                       "{\"operation\":\"x\",\"outcome\":\"i\"}}"),
+                 "schema_invalid") == 0, "emit phase intent rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"emit\",\"phase\":\"whatever\",\"record\":"
+                       "{\"operation\":\"x\",\"outcome\":\"o\"}}"),
+                 "schema_invalid") == 0, "emit arbitrary phase rejected");
+    /* emit must be a non-effect path */
+    CHECK(strcmp(PARSE("{\"type\":\"emit\",\"phase\":\"preview\",\"record\":"
+                       "{\"operation\":\"x\",\"outcome\":\"o\","
+                       "\"effect_issued\":true}}"),
+                 "schema_invalid") == 0, "emit with effect_issued rejected");
+    /* emit takes no binding and no extra channel fields */
+    CHECK(strcmp(PARSE("{\"type\":\"emit\",\"phase\":\"preview\",\"binding\":"
+                       "\"x\",\"record\":{\"operation\":\"x\",\"outcome\":"
+                       "\"o\"}}"), "schema_invalid") == 0,
+          "emit with a binding rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"emit\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"o\"}}"), "schema_invalid") == 0,
+          "emit without a phase rejected");
+
     /* --- duplicate keys rejected (JSON_REJECT_DUPLICATES) --- */
     CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"type\":\"open_intent\","
                        "\"record\":{\"operation\":\"x\",\"outcome\":\"i\"}}"),
@@ -131,6 +175,11 @@ int main(void) {
         r = rab_response_outcome_ok();
         CHECK(r != NULL && strcmp(r, "{\"ok\":true,\"persisted\":true}") == 0,
               "outcome_ok golden bytes");
+        free(r);
+        r = rab_response_emit_ok("cid1", "system");
+        CHECK(r != NULL && strcmp(r,
+            "{\"audit_scope\":\"system\",\"correlation_id\":\"cid1\","
+            "\"ok\":true,\"persisted\":true}") == 0, "emit_ok golden bytes");
         free(r);
         r = rab_response_error("schema_invalid", "nope");
         CHECK(r != NULL && strcmp(r,

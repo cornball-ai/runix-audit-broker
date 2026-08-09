@@ -17,12 +17,14 @@
 
 typedef enum {
     RAB_REQ_OPEN_INTENT,
-    RAB_REQ_WRITE_OUTCOME
+    RAB_REQ_WRITE_OUTCOME,
+    RAB_REQ_EMIT
 } rab_req_type;
 
 typedef struct {
     rab_req_type type;
-    char binding[RAB_BINDING_STR_MAX]; /* write_outcome only; "" for open */
+    char binding[RAB_BINDING_STR_MAX]; /* write_outcome only; "" otherwise */
+    char phase[16];                    /* emit only: "preview"|"noop"; "" else */
     json_t *record;                    /* borrowed from root */
     json_t *root;                      /* owned; free via rab_request_free */
 } rab_request;
@@ -45,6 +47,8 @@ int rab_json_depth(const json_t *v);
 char *rab_response_open_ok(const char *correlation_id, const char *binding,
                            const char *audit_scope);
 char *rab_response_outcome_ok(void);
+/* emit success: a minted correlation id and no binding (opens no intent). */
+char *rab_response_emit_ok(const char *correlation_id, const char *audit_scope);
 char *rab_response_error(const char *code, const char *message);
 
 #endif /* RAB_JSON_H */

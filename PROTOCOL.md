@@ -28,7 +28,7 @@ One request frame yields exactly one response frame (same framing).
 
 ## Requests (client -> broker)
 
-Exactly two `type`s. Any other is `unknown_request`.
+Exactly three `type`s. Any other is `unknown_request`.
 
 ```jsonc
 // open an intent (before the effect is issued)
@@ -39,7 +39,19 @@ Exactly two `type`s. Any other is `unknown_request`.
 { "type": "write_outcome",
   "binding": "<opaque token from the open_intent response>",
   "record": { /* domain content: outcome, effect_issued, observed, ... */ } }
+
+// emit a single non-effect record (a preview or a pre-effect no-op)
+{ "type": "emit",
+  "phase": "preview" | "noop",           // no other phase is accepted
+  "record": { /* non-effect domain content; effect_issued must not be true */ } }
 ```
+
+`emit` is deliberately narrow: it mints a `correlation_id`, returns **no
+binding**, opens no intent (so it can never be followed by a `write_outcome`),
+and accepts only `preview`/`noop` with a non-effect record. It is **not** a
+general "append arbitrary audit JSON" channel — the same record schema and
+identity rules apply, and it is rate/quota/rotation-poison accounted exactly
+like the effect paths.
 
 - The body is parsed by **Jansson** (system, apt-serviced) with
   `JSON_REJECT_DUPLICATES` (native duplicate-key rejection) and strict EOF (no
@@ -67,6 +79,10 @@ Exactly two `type`s. Any other is `unknown_request`.
 
 // write_outcome success
 { "ok": true, "persisted": true }
+
+// emit success (no binding: it opens no intent)
+{ "ok": true, "correlation_id": "<minted>", "persisted": true,
+  "audit_scope": "system" }
 
 // any error (typed, closed set)
 { "ok": false, "error": "<code>", "message": "<human detail>" }

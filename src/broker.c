@@ -463,6 +463,47 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
     return reply(resp, rab_response_outcome_ok());
 }
 
+/* A single non-effect record (preview / no-op). It mints a correlation id but
+ * opens no intent and returns no binding, so it can never be paired with a
+ * write_outcome. It is rate/free-space/rotation-poison accounted exactly like
+ * the effect paths. The phase (preview|noop) and the non-effect record were
+ * already constrained by the parser, so this cannot be a generic append. */
+static int handle_emit(rab_broker *b, const rab_actor *actor,
+                       const rab_request *req, char **resp) {
+    unsigned long long now = b->clock(b->clock_ctx);
+    if (!rate_allowed(b, actor->uid, now)) {
+        return reply(resp,
+                     rab_response_error("rate_limited", "per-uid rate exceeded"));
+    }
+    if (!enough_free_space(b)) {
+        return reply(resp, rab_response_error("persist_failed",
+                                              "insufficient free space"));
+    }
+    char cid[RAB_CID_MAX];
+    if (rab_make_correlation_id(cid, sizeof cid) != 0) {
+        return reply(resp, rab_response_error("internal", "id minting failed"));
+    }
+    char *line = rab_build_audit(req->phase, cid, NULL /* no binding */, actor,
+                                 b->host, now, req->record);
+    if (line == NULL) {
+        return reply(resp, rab_response_error("internal", "record build"));
+    }
+    if (append_line(b, line) != 0) {
+        free(line);
+        return reply(resp,
+                     rab_response_error("persist_failed", "sink append failed"));
+    }
+    free(line);
+    rate_note(b, actor->uid, now);
+    maybe_rotate(b);
+    if (b->poisoned) {
+        return reply(resp, rab_response_error(
+                               "persist_failed",
+                               "audit durability uncertain after rotation"));
+    }
+    return reply(resp, rab_response_emit_ok(cid, "system"));
+}
+
 int rab_broker_handle(rab_broker *b, const rab_actor *actor,
                       const rab_request *req, char **resp) {
     *resp = NULL;
@@ -473,10 +514,15 @@ int rab_broker_handle(rab_broker *b, const rab_actor *actor,
                                "persist_failed",
                                "sink unusable after a write fault; restart required"));
     }
-    if (req->type == RAB_REQ_OPEN_INTENT) {
+    switch (req->type) {
+    case RAB_REQ_OPEN_INTENT:
         return handle_open(b, actor, req, resp);
+    case RAB_REQ_WRITE_OUTCOME:
+        return handle_outcome(b, actor, req, resp);
+    case RAB_REQ_EMIT:
+        return handle_emit(b, actor, req, resp);
     }
-    return handle_outcome(b, actor, req, resp);
+    return reply(resp, rab_response_error("internal", "unhandled request type"));
 }
 
 /* ---- startup reconstruction -------------------------------------------- */

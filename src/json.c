@@ -147,6 +147,7 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
     req->root = NULL;
     req->record = NULL;
     req->binding[0] = '\0';
+    req->phase[0] = '\0';
 
     json_error_t jerr;
     /* JSON_REJECT_DUPLICATES: reject duplicate keys. No JSON_DISABLE_EOF_CHECK
@@ -201,6 +202,34 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
         memcpy(req->binding, b, bl);
         req->binding[bl] = '\0';
         req->type = RAB_REQ_WRITE_OUTCOME;
+    } else if (strcmp(type, "emit") == 0) {
+        /* a single non-effect record: only preview/noop, effect_issued false,
+         * no binding, opens no intent. Deliberately NOT a generic append. */
+        static const char *const allowed[] = {"type", "phase", "record"};
+        json_t *jphase = json_object_get(root, "phase");
+        if (!only_keys(root, allowed, 3) || !json_is_string(jphase) ||
+            !json_is_object(record) || !record_valid(record)) {
+            json_decref(root);
+            *errcode = "schema_invalid";
+            return -1;
+        }
+        const char *ph = json_string_value(jphase);
+        if ((strcmp(ph, "preview") != 0 && strcmp(ph, "noop") != 0) ||
+            strlen(ph) >= sizeof req->phase) {
+            json_decref(root);
+            *errcode = "schema_invalid";
+            return -1;
+        }
+        json_t *ei = json_object_get(record, "effect_issued");
+        if (ei != NULL && json_is_true(ei)) { /* non-effect path only */
+            json_decref(root);
+            *errcode = "schema_invalid";
+            return -1;
+        }
+        size_t pl = strlen(ph);
+        memcpy(req->phase, ph, pl);
+        req->phase[pl] = '\0';
+        req->type = RAB_REQ_EMIT;
     } else {
         json_decref(root);
         *errcode = "unknown_request";
@@ -248,6 +277,18 @@ char *rab_response_outcome_ok(void) {
     }
     json_object_set_new(o, "ok", json_true());
     json_object_set_new(o, "persisted", json_true());
+    return dump_compact(o);
+}
+
+char *rab_response_emit_ok(const char *correlation_id, const char *audit_scope) {
+    json_t *o = json_object();
+    if (o == NULL) {
+        return NULL;
+    }
+    json_object_set_new(o, "ok", json_true());
+    json_object_set_new(o, "correlation_id", json_string(correlation_id));
+    json_object_set_new(o, "persisted", json_true());
+    json_object_set_new(o, "audit_scope", json_string(audit_scope));
     return dump_compact(o);
 }
 
