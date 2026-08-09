@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -1185,7 +1186,25 @@ static void test_retention_bounds(void) {
         cleanup_dir(dir);
     }
 
-    /* --- total-byte retention (active segment counts toward the budget) --- */
+    /* --- a byte budget below one segment is rejected (fail closed) --- */
+    {
+        char dir[256], path[512];
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_config cfg;
+        rab_config_defaults(&cfg);
+        cfg.rotate_bytes = 4096;
+        cfg.retain_bytes = 1024; /* < rotate_bytes: unsatisfiable */
+        err = NULL;
+        rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b == NULL, "retain_bytes < rotate_bytes rejected");
+        CHECK(err != NULL, "config rejection sets err");
+        cleanup_dir(dir);
+    }
+
+    /* --- total-byte retention; the active segment alone can exceed the budget,
+     * and when it does every archive is pruned while the active segment (and its
+     * unresolved intents) stands. --- */
     {
         char dir[256], path[512];
         tmpdir(dir, sizeof dir);
@@ -1193,34 +1212,126 @@ static void test_retention_bounds(void) {
         rab_config cfg;
         rab_config_defaults(&cfg);
         cfg.rotate_bytes = 256;
-        cfg.retain_segments = 0; /* count unlimited */
-        cfg.retain_bytes = 100;  /* below one record: the active seg alone exceeds it */
+        cfg.retain_segments = 0;   /* count unlimited */
+        cfg.retain_bytes = 256;    /* == rotate_bytes (minimal valid budget) */
+        cfg.max_open_per_uid = 100;
         g_step = 2;
+        err = NULL;
 
         rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
         CHECK(b != NULL, "broker open (byte retention)");
-        char kb[RAB_BINDING_STR_MAX], kc[RAB_CID_MAX];
-        CHECK(strcmp(do_open(b, &a, kb, kc), "OK") == 0, "unresolved intent opened");
-        int emits_ok = 1;
-        for (int i = 0; i < 6; i++) {
-            if (strcmp(do_emit(b, &a, "preview", NULL), "OK") != 0) {
-                emits_ok = 0;
+        /* four unresolved intents: each rotation re-checkpoints all of them, so
+         * the active segment's checkpoint set alone exceeds retain_bytes. */
+        char kb[4][RAB_BINDING_STR_MAX], kc[4][RAB_CID_MAX];
+        int opened = 1;
+        for (int i = 0; i < 4; i++) {
+            if (strcmp(do_open(b, &a, kb[i], kc[i]), "OK") != 0) {
+                opened = 0;
             }
         }
-        CHECK(emits_ok, "emits (byte retention) succeed");
+        CHECK(opened, "four unresolved intents opened");
         CHECK(count_archives(dir, "audit.jsonl") == 0,
-              "a byte budget below the active size prunes all archives");
+              "active exceeding the budget prunes every archive");
         rab_broker_close(b);
 
         b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
         CHECK(b != NULL, "reopen after byte pruning");
-        CHECK(rab_broker_open_count(b) == 1,
-              "unresolved intent survived byte pruning");
-        CHECK(rab_broker_has_open(b, kc), "the exact intent survived");
+        CHECK(rab_broker_open_count(b) == 4,
+              "all unresolved intents survived byte pruning");
+        CHECK(rab_broker_has_open(b, kc[0]) && rab_broker_has_open(b, kc[3]),
+              "the exact intents survived");
         rab_broker_close(b);
         cleanup_dir(dir);
     }
     g_step = 1;
+}
+
+/* Requirement (c): retention only ever touches broker-owned regular archive
+ * files. A symlink named like an archive is neither followed nor deleted, and
+ * its target is untouched. */
+static void test_retention_symlink_safety(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rotate_bytes = 256;
+    cfg.retain_segments = 1;
+    cfg.retain_bytes = 0;
+    g_step = 2;
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+
+    /* a precious file outside the sink, and a symlink named like an archive */
+    char precious[600], link[600];
+    snprintf(precious, sizeof precious, "%s/precious.txt", dir);
+    FILE *pf = fopen(precious, "w");
+    if (pf) {
+        fputs("do not delete\n", pf);
+        fclose(pf);
+    }
+    snprintf(link, sizeof link, "%s.9999999999999999", path); /* archive-shaped */
+    CHECK(symlink(precious, link) == 0, "planted archive-named symlink");
+
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (symlink safety)");
+    char keep_bind[RAB_BINDING_STR_MAX], keep_cid[RAB_CID_MAX];
+    CHECK(strcmp(do_open(b, &a, keep_bind, keep_cid), "OK") == 0, "open");
+    int emits_ok = 1;
+    for (int i = 0; i < 6; i++) {
+        if (strcmp(do_emit(b, &a, "preview", NULL), "OK") != 0) {
+            emits_ok = 0;
+        }
+    }
+    CHECK(emits_ok, "emits force pruning");
+    rab_broker_close(b);
+
+    /* the symlink was skipped (not treated as an archive) and its target lives */
+    struct stat st;
+    CHECK(lstat(link, &st) == 0 && S_ISLNK(st.st_mode),
+          "archive-named symlink not deleted by retention");
+    CHECK(stat(precious, &st) == 0, "symlink target untouched");
+    cleanup_dir(dir);
+}
+
+/* Requirement (d): the rate window boundary is inclusive. An op whose timestamp
+ * is exactly `now - window` old still counts against the limit; one microsecond
+ * older does not. */
+static void test_rate_window_boundary(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rate_max_in_window = 1;
+    cfg.rate_window_sec = 10;
+    cfg.max_open_per_uid = 100;
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    unsigned long long window_us = (unsigned long long) cfg.rate_window_sec * 1000000ull;
+    unsigned long long t0 = 2600000000000000ull;
+
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (boundary)");
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX];
+
+    g_step = 0;
+    g_now = t0;
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0, "op at t0 fills the limit");
+
+    /* now exactly one window later: the t0 op is at now-window, still in-window */
+    g_now = t0 + window_us;
+    CHECK(strcmp(do_open(b, &a, bind, cid), "rate_limited") == 0,
+          "op exactly at now-window is still counted (inclusive boundary)");
+
+    /* one microsecond past the boundary: the t0 op ages out, op allowed */
+    g_now = t0 + window_us + 1;
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0,
+          "op one microsecond past the boundary is allowed");
+    rab_broker_close(b);
+    g_step = 1;
+    g_now = 1700000000000000ull;
+    cleanup_dir(dir);
 }
 
 int main(void) {
@@ -1240,6 +1351,8 @@ int main(void) {
     test_rate_limit_survives_restart();
     test_rate_carry_survives_rotation();
     test_retention_bounds();
+    test_retention_symlink_safety();
+    test_rate_window_boundary();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

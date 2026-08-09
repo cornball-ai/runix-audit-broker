@@ -363,6 +363,7 @@ static void apply_retention(rab_broker *b) {
         base = slash + 1;
     }
     size_t baselen = strlen(base);
+    uid_t self = geteuid();
     DIR *d = opendir(dir);
     if (d == NULL) {
         return;
@@ -385,8 +386,13 @@ static void apply_retention(rab_broker *b) {
             (int) sizeof full) {
             continue;
         }
+        /* lstat, not stat: never follow a symlink. Only a regular file owned by
+         * the broker is a candidate; a symlink or a file planted by another uid
+         * is skipped, so retention can never delete an unexpected path. (unlink
+         * itself never follows a symlink, but we also refuse to count one.) */
         struct stat st;
-        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (lstat(full, &st) != 0 || !S_ISREG(st.st_mode) ||
+            st.st_uid != self) {
             continue;
         }
         if (n == cap) {
@@ -433,9 +439,19 @@ static void apply_retention(rab_broker *b) {
             pruned = 1;
         }
     }
+    /* The active segment is never deleted to meet the byte budget: if it alone
+     * exceeds retain_bytes (e.g. a large open-intent checkpoint set), retention
+     * prunes every archive and the active segment stands. Audit is never
+     * destroyed to satisfy a bound. */
     free(ents);
-    if (pruned) {
-        rab_fsync_parent_dir(b->path); /* make the deletions durable */
+    if (pruned && rab_fsync_parent_dir(b->path) != 0) {
+        /* The unlinks are not yet durable. This is not a correctness fault: a
+         * crash could resurrect a pruned archive, but a resurrected archive is
+         * harmless (reconstruction never reads archives) and is re-pruned at the
+         * next rotation. So retention never poisons the broker or fails a
+         * request on this — unlike the rotation rename, whose loss would drop an
+         * acknowledged write. */
+        (void) 0;
     }
 }
 
@@ -989,6 +1005,16 @@ rab_broker *rab_broker_open(const char *path, const rab_config *cfg,
     }
     b->fd = -1;
     b->cfg = *cfg;
+    /* A byte budget smaller than a single segment can never be met by pruning
+     * archives (the active segment alone would exceed it), so reject the
+     * configuration rather than silently running a bound that cannot hold. */
+    if (b->cfg.retain_bytes != 0 && b->cfg.rotate_bytes != 0 &&
+        b->cfg.retain_bytes < b->cfg.rotate_bytes) {
+        *err = "retain_bytes must be >= rotate_bytes";
+        free(b->path);
+        free(b);
+        return NULL;
+    }
     b->clock = clock ? clock : real_clock;
     b->clock_ctx = ctx;
     if (gethostname(b->host, sizeof b->host) != 0) {
