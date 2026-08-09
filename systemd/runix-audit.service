@@ -28,7 +28,11 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-ProtectProc=invisible
+# NB: no ProtectProc=invisible / ProcSubset=pid. The broker must read peer
+# processes' /proc/<pid>/stat to capture their start time (part of the actor
+# identity that defeats PID reuse). ProtectProc would be a no-op under root and
+# would actively hide other users' /proc entries if the broker ran unprivileged
+# -- either way it is not counted as hardening here.
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes

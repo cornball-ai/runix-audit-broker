@@ -9,7 +9,9 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -46,6 +48,7 @@ struct rab_broker {
     size_t open_count;
     uid_state *uids;
     unsigned long long seg_bytes;
+    int poisoned; /* a partial append / fsync uncertainty: refuse until restart */
 };
 
 void rab_config_defaults(rab_config *cfg) {
@@ -53,7 +56,8 @@ void rab_config_defaults(rab_config *cfg) {
     cfg->max_open_global = 32768;
     cfg->rate_window_sec = 10;
     cfg->rate_max_in_window = 2000;
-    cfg->rotate_bytes = 64ull << 20; /* 64 MiB current-segment cap */
+    cfg->rotate_bytes = 64ull << 20;    /* 64 MiB current-segment cap */
+    cfg->min_free_bytes = 64ull << 20;  /* refuse appends below 64 MiB free */
 }
 
 static unsigned long long real_clock(void *ctx) {
@@ -205,9 +209,30 @@ static void open_remove(rab_broker *b, intent *target) {
 
 /* ---- append + carry-forward rotation ----------------------------------- */
 
+/* True iff the sink filesystem has at least cfg.min_free_bytes free. A
+ * near-full disk is a transient refusal (persist_failed), not corruption, so it
+ * does not poison the broker. */
+static int enough_free_space(rab_broker *b) {
+    if (b->cfg.min_free_bytes == 0) {
+        return 1;
+    }
+    struct statvfs vfs;
+    if (statvfs(b->path, &vfs) != 0) {
+        return 0; /* cannot tell: fail closed */
+    }
+    unsigned long long freeb =
+        (unsigned long long) vfs.f_bavail * (unsigned long long) vfs.f_frsize;
+    return freeb >= b->cfg.min_free_bytes;
+}
+
+/* Append one record line. On ANY failure the sink may hold a partial line, so
+ * the broker is poisoned (refuses further appends until a restart reconstructs
+ * and truncates it) rather than risk concatenating the next record onto torn
+ * bytes. */
 static int append_line(rab_broker *b, const char *line) {
     size_t len = strlen(line);
     if (rab_sink_append(b->fd, line, len) != 0) {
+        b->poisoned = 1;
         return -1;
     }
     b->seg_bytes += (unsigned long long) len + 1; /* record + newline */
@@ -265,27 +290,43 @@ static int rotate(rab_broker *b) {
         unlink(pending);
         return -1;
     }
+    /* Serialize the swap against any appender to the current sink (the broker
+     * is single-instance, but take the same lock appends use as defense). */
+    if (flock(b->fd, LOCK_EX) != 0) {
+        close(pfd);
+        unlink(pending);
+        return -1;
+    }
     /* archive the old segment (hardlink) then fsync the dir, so the new
      * segment + its parent dir are durable before the old one is retired. */
     if (link(b->path, arch) != 0 || rab_fsync_parent_dir(b->path) != 0) {
+        flock(b->fd, LOCK_UN);
         close(pfd);
         unlink(pending);
         unlink(arch); /* may not exist; ignore */
         return -1;
     }
     if (rename(pending, b->path) != 0) {
+        flock(b->fd, LOCK_UN);
         close(pfd);
         unlink(pending);
         /* arch remains as a harmless duplicate hardlink of the current file */
         return -1;
     }
-    rab_fsync_parent_dir(b->path); /* best effort; rename already committed */
+    /* The rename is committed but not yet durable. If we cannot fsync the
+     * parent directory, a crash could roll the rename back and lose an
+     * acknowledged write's segment: that is unrecoverable uncertainty, so
+     * poison the broker rather than keep serving. */
+    if (rab_fsync_parent_dir(b->path) != 0) {
+        b->poisoned = 1;
+    }
+    flock(b->fd, LOCK_UN);
     close(b->fd);
     b->fd = pfd;
     struct stat st;
     b->seg_bytes =
         (fstat(pfd, &st) == 0) ? (unsigned long long) st.st_size : 0;
-    return 0;
+    return b->poisoned ? -1 : 0;
 }
 
 static void maybe_rotate(rab_broker *b) {
@@ -320,6 +361,10 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
     if (u->open >= b->cfg.max_open_per_uid) {
         return reply(resp, rab_response_error("rate_limited",
                                               "per-uid open-intent cap"));
+    }
+    if (!enough_free_space(b)) {
+        return reply(resp, rab_response_error("persist_failed",
+                                              "insufficient free space"));
     }
     char cid[RAB_CID_MAX];
     char binding[RAB_BINDING_MAX];
@@ -365,6 +410,10 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
                                "actor_mismatch",
                                "peer identity does not match the opener"));
     }
+    if (!enough_free_space(b)) {
+        return reply(resp, rab_response_error("persist_failed",
+                                              "insufficient free space"));
+    }
     char *line = rab_build_record(RAB_PHASE_OUTCOME, it->cid, NULL, actor,
                                   b->host, now, req->record);
     if (line == NULL) {
@@ -385,6 +434,13 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
 int rab_broker_handle(rab_broker *b, const rab_actor *actor,
                       const rab_request *req, char **resp) {
     *resp = NULL;
+    if (b->poisoned) {
+        /* a prior partial append / fsync uncertainty: refuse everything until a
+         * restart reconstructs and truncates the sink. */
+        return reply(resp, rab_response_error(
+                               "persist_failed",
+                               "sink unusable after a write fault; restart required"));
+    }
     if (req->type == RAB_REQ_OPEN_INTENT) {
         return handle_open(b, actor, req, resp);
     }
@@ -536,6 +592,22 @@ static int slurp_segment(const char *path, char **buf, size_t *total,
     return 0;
 }
 
+/* Physically truncate `path` to `len` bytes and fsync, removing a torn tail so
+ * the next append cannot concatenate a valid record onto partial bytes.
+ * Returns 0 on success, -1 on failure. */
+static int truncate_to(const char *path, off_t len) {
+    int fd = open(path, O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    int rc = 0;
+    if (ftruncate(fd, len) != 0 || fsync(fd) != 0) {
+        rc = -1;
+    }
+    close(fd);
+    return rc;
+}
+
 static int reconstruct(rab_broker *b, const char **err) {
     char *buf = NULL;
     size_t total = 0;
@@ -544,13 +616,18 @@ static int reconstruct(rab_broker *b, const char **err) {
     }
     cidnode *closed = NULL;
     int rc = 0;
+    int torn = 0;
+    size_t keep_bytes = 0;
     char *p = buf;
     char *end = buf + total;
     while (p < end) {
         char *nl = memchr(p, '\n', (size_t) (end - p));
         if (nl == NULL) {
             /* trailing bytes with no newline: a torn final record from a
-             * crash mid-append. Discard exactly that partial tail. */
+             * crash mid-append. Discard exactly that partial tail, and record
+             * where the last durable record ended so we can truncate it off. */
+            torn = 1;
+            keep_bytes = (size_t) (p - buf);
             break;
         }
         size_t linelen = (size_t) (nl - p);
@@ -577,7 +654,17 @@ static int reconstruct(rab_broker *b, const char **err) {
     }
     free(buf);
     cid_free(closed);
-    return rc;
+    if (rc != 0) {
+        return rc;
+    }
+    /* Repair a torn tail on disk before we ever append: truncate to the last
+     * durable newline and fsync. Failing to do so would let the next record
+     * join onto the partial bytes and corrupt the sink. */
+    if (torn && truncate_to(b->path, (off_t) keep_bytes) != 0) {
+        *err = "cannot truncate a torn-tail record during reconstruction";
+        return -1;
+    }
+    return 0;
 }
 
 /* ---- lifecycle --------------------------------------------------------- */

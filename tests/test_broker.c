@@ -333,6 +333,37 @@ static void test_reconstruction_fails_closed(void) {
     }
 }
 
+/* count how many whole newline-terminated lines a file has, and whether every
+ * one of them parses as JSON (no torn/concatenated bytes). */
+static void file_line_stats(const char *path, int *lines, int *parseable,
+                            long *size) {
+    *lines = 0;
+    *parseable = 0;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        *size = -1;
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    *size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char line[8192];
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        if (n == 0 || line[n - 1] != '\n') {
+            continue; /* torn tail: not a whole line */
+        }
+        (*lines)++;
+        json_error_t e;
+        json_t *r = json_loads(line, 0, &e);
+        if (r) {
+            (*parseable)++;
+            json_decref(r);
+        }
+    }
+    fclose(f);
+}
+
 static void test_partial_tail_recovery(void) {
     char dir[256], path[512];
     tmpdir(dir, sizeof dir);
@@ -342,9 +373,12 @@ static void test_partial_tail_recovery(void) {
     const char *err = NULL;
     rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
 
-    /* one good intent, then a torn final record (no trailing newline) */
+    /* one good intent, then a torn final record (no trailing newline). Capture
+     * the good portion's size so we can prove the tail is truncated on disk. */
     FILE *f = fopen(path, "w");
     craft_line(f, RAB_PHASE_INTENT, "cid-good", "bind-good", &a);
+    fflush(f);
+    long good_size = ftell(f);
     fputs("{\"phase\":\"intent\",\"correlation_id\":\"cid-tor", f); /* torn */
     fclose(f);
 
@@ -352,9 +386,46 @@ static void test_partial_tail_recovery(void) {
     CHECK(b != NULL, "partial tail recovered (broker opens)");
     CHECK(b != NULL && rab_broker_open_count(b) == 1, "good record kept");
     CHECK(b != NULL && rab_broker_has_open(b, "cid-good"), "good cid open");
-    /* the good intent is still closable */
+
+    /* the torn bytes are physically removed from the file, not merely ignored */
+    {
+        int lines = 0, ok = 0;
+        long size = 0;
+        file_line_stats(path, &lines, &ok, &size);
+        CHECK(size == good_size, "torn tail truncated on disk");
+        CHECK(lines == 1 && ok == 1, "exactly one whole, parseable line remains");
+    }
+
+    /* appending after recovery must not concatenate onto torn bytes: closing
+     * the good intent yields a clean two-line, fully-parseable file. */
     CHECK(strcmp(do_outcome(b, &a, "bind-good"), "OK") == 0,
           "recovered intent closable");
+    rab_broker_close(b);
+    {
+        int lines = 0, ok = 0;
+        long size = 0;
+        file_line_stats(path, &lines, &ok, &size);
+        CHECK(lines == 2 && ok == 2,
+              "post-recovery append leaves two whole, parseable lines");
+    }
+    cleanup_dir(dir);
+}
+
+static void test_free_space_refusal(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.min_free_bytes = (unsigned long long) -1; /* larger than any disk */
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (free space)");
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX];
+    CHECK(strcmp(do_open(b, &a, bind, cid), "persist_failed") == 0,
+          "append refused below the free-space reserve");
+    CHECK(rab_broker_open_count(b) == 0, "nothing recorded when refused");
     rab_broker_close(b);
     cleanup_dir(dir);
 }
@@ -521,6 +592,7 @@ int main(void) {
     test_identity_and_replay();
     test_reconstruction_fails_closed();
     test_partial_tail_recovery();
+    test_free_space_refusal();
     test_carry_forward_idempotency();
     test_rotation_preserves_open_intents();
     test_bounded_open_intents();

@@ -42,8 +42,11 @@ Exactly two `type`s. Any other is `unknown_request`.
 ```
 
 - The body is parsed by **Jansson** (system, apt-serviced) with
-  `JSON_REJECT_DUPLICATES` (native duplicate-key rejection), strict EOF (no
-  trailing content), `JSON_VALIDATE_UTF8`, and a bounded parse depth. No
+  `JSON_REJECT_DUPLICATES` (native duplicate-key rejection) and strict EOF (no
+  trailing content: `JSON_DISABLE_EOF_CHECK` is left unset). Jansson validates
+  UTF-8 inherently during parsing (there is no `JSON_VALIDATE_UTF8` load flag in
+  2.14). The protocol's tighter nesting limit is enforced in schema validation
+  (Jansson's own compiled limit is 2048, far deeper than our records). No
   hand-written parser.
 - The `record` is validated against the durable-audit schema: required fields
   present, correct types, integers in range, **no** unexpected fields,

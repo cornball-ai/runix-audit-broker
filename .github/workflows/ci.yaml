@@ -68,18 +68,28 @@ jobs:
           test -n "$deb" || { echo "::error::no .deb produced"; exit 1; }
           sudo apt-get install -y "$deb"
 
-      - name: Exercise real socket activation
+      - name: Exercise real socket activation (unprivileged client)
         run: |
           sudo systemctl daemon-reload
           sudo systemctl start runix-audit.socket
           systemctl is-active runix-audit.socket
           make probe
-          # connecting triggers systemd to activate the service on demand
-          sudo ./rab-probe /run/runix-audit.sock
+          # connect as the UNPRIVILEGED runner user (not root): the whole point
+          # is that an unprivileged caller's record is attributed to it and
+          # persisted to the root-owned sink it cannot write directly.
+          test "$(id -u)" -ne 0 || { echo "::error::probe must run unprivileged"; exit 1; }
+          ./rab-probe /run/runix-audit.sock
           # the activated service must have written its fixed sink
           sudo test -s /var/log/runix/audit.jsonl
-          sudo grep -q '"operation":"ci.probe"' /var/log/runix/audit.jsonl
-          echo "socket activation + durable write confirmed"
+          line=$(sudo grep '"operation":"ci.probe"' /var/log/runix/audit.jsonl | tail -n1)
+          test -n "$line" || { echo "::error::no ci.probe record"; exit 1; }
+          # the record's actor must be the SO_PEERCRED uid (this runner), never root
+          runner=$(id -u)
+          echo "$line" | grep -Eq "\"(uid|actor)\":\"?${runner}\b" || {
+            echo "::error::record not attributed to the unprivileged caller (uid ${runner})"; echo "$line"; exit 1; }
+          echo "$line" | grep -Eq "\"(uid|actor)\":\"?0\b" && {
+            echo "::error::record wrongly attributed to root"; exit 1; } || true
+          echo "socket activation + unprivileged attribution + durable write confirmed"
 
       - name: Assert the sandbox directives took effect
         run: |

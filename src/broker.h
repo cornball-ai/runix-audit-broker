@@ -17,6 +17,7 @@ typedef struct {
     unsigned rate_window_sec;        /* per-uid op rate window (seconds) */
     unsigned rate_max_in_window;     /* max appended records/uid/window (0=off) */
     unsigned long long rotate_bytes; /* rotate segment past this (0=never) */
+    unsigned long long min_free_bytes; /* refuse appends below this fs free (0=off) */
 } rab_config;
 
 void rab_config_defaults(rab_config *cfg);
