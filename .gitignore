@@ -13,6 +13,9 @@ crash-*
 leak-*
 timeout-*
 oom-*
+# fuzzer-discovered corpus entries: keep only the curated *.json seeds
+fuzz/corpus/*
+!fuzz/corpus/*.json
 *.deb
 *.buildinfo
 *.changes
