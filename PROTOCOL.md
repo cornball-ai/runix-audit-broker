@@ -146,6 +146,32 @@ protocol input.
 - A disconnect between `open_intent` and `write_outcome` leaves the intent as
   a durable, queryable **open** operation. It is never rolled back or erased.
 
+## On-disk segments, carry-forward, and retention
+
+These are broker-internal (not wire protocol), but they shape what a reader
+finds on disk:
+
+- The sink is a sequence of newline-delimited JSON records. When the active
+  segment passes `rotate_bytes`, it rotates: the broker writes every still-open
+  intent as a `broker_checkpoint` into a fresh segment, hardlinks the old
+  segment to an archive (`<sink>.<microseconds>`), then atomically swaps the new
+  segment into place. The current path is always the authoritative superset, so
+  a crash mid-rotation never loses an open intent.
+- **Rate carry.** Rotation also writes one `broker_rate` record per active uid
+  into the new segment: the broker-assigned timestamps still inside the rate
+  window. The audit records that seeded the per-uid rate limit move to the
+  archive (which startup reconstruction never reads), so this carry is what
+  keeps the limit from resetting on the next restart.
+- **Retention.** Total on-disk audit is bounded by both a segment count and a
+  total byte budget (the active segment counts toward the bytes). The oldest
+  archives are pruned first, and **only after** the new checkpointed segment is
+  durably swapped in. Because every open intent is re-materialised as a
+  checkpoint in the retained active segment, retention can never discard an
+  unresolved intent.
+- Reconstruction reads only the current segment; `broker_checkpoint` and
+  `broker_rate` records in it are parsed with the same strict, fail-closed
+  validation as `audit` records.
+
 ## Identity and paths
 
 - The actor is the full `SO_PEERCRED` identity (`uid`, `gid`, `pid`, plus boot
