@@ -95,7 +95,7 @@ Error codes (closed set; deterministic per input):
 | `bad_frame` | version wrong, or a truncated/interrupted frame |
 | `too_large` | body length exceeds the maximum |
 | `bad_json` | body is not valid UTF-8 JSON, or has trailing content |
-| `unknown_request` | `type` is not `open_intent`/`write_outcome` |
+| `unknown_request` | `type` is not `open_intent`/`write_outcome`/`emit` |
 | `schema_invalid` | record fails schema/type/range/extra-field checks |
 | `unknown_intent` | `binding` matches no open intent |
 | `actor_mismatch` | `binding` belongs to a different `SO_PEERCRED` actor |
