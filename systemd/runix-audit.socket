@@ -1,0 +1,14 @@
+[Unit]
+Description=Runix audit broker socket
+Documentation=https://github.com/cornball-ai/runix-audit-broker
+
+[Socket]
+ListenStream=/run/runix-audit.sock
+# Any local process may connect; the broker identifies the peer by
+# SO_PEERCRED (kernel-verified), not by socket permissions, and rate-limits
+# per actor. The socket lives directly in /run (always present, tmpfs).
+SocketMode=0666
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

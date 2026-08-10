@@ -1,0 +1,1 @@
+{"type":"open_intent","record":{"operation":"svc.restart","outcome":"intent","resource":"nginx.service","observed":{"active":"active","sub":"running"}}}

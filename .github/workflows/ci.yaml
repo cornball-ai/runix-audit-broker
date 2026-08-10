@@ -1,0 +1,105 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Native build + sanitized tests + fuzzing. Every step is mandatory: no step
+  # is guarded behind a hashFiles/if skip that would pass by doing nothing.
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libjansson-dev pkg-config clang
+
+      - name: Sanitized unit + socket tests (ASan/UBSan)
+        run: make check
+
+      - name: Build the hardened binary (dpkg-buildflags)
+        run: make
+
+      - name: Standalone sanitizer build of the binary
+        run: |
+          make clean
+          make CC=clang \
+            CFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      - name: Protocol/parser fuzz (short, mandatory)
+        run: |
+          make clean
+          make fuzz CC=clang
+          ./fuzz-proto fuzz/corpus -runs=400000 -max_total_time=60
+
+  # Packaging + real socket activation + sandbox. This is a mandatory gate: it
+  # proves systemd is the running service manager, installs the .deb, and drives
+  # activation. If systemd is absent it FAILS rather than skipping to green.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y devscripts debhelper libjansson-dev \
+            pkg-config build-essential
+
+      - name: Prove systemd is the service manager
+        run: |
+          if [ ! -d /run/systemd/system ]; then
+            echo "::error::systemd is not the running init; activation gate cannot run"
+            exit 1
+          fi
+          systemctl --version
+          # 'running' or 'degraded' both mean systemd is live and managing units
+          systemctl is-system-running || true
+
+      - name: Build the .deb
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Install the .deb
+        run: |
+          deb=$(find .. -maxdepth 1 -name 'runix-audit-broker_*.deb' | head -n1)
+          test -n "$deb" || { echo "::error::no .deb produced"; exit 1; }
+          sudo apt-get install -y "$deb"
+
+      - name: Exercise real socket activation (unprivileged client)
+        run: |
+          sudo systemctl daemon-reload
+          sudo systemctl start runix-audit.socket
+          systemctl is-active runix-audit.socket
+          make probe
+          # connect as the UNPRIVILEGED runner user (not root): the whole point
+          # is that an unprivileged caller's record is attributed to it and
+          # persisted to the root-owned sink it cannot write directly.
+          test "$(id -u)" -ne 0 || { echo "::error::probe must run unprivileged"; exit 1; }
+          ./rab-probe /run/runix-audit.sock
+          # the activated service must have written its fixed sink
+          sudo test -s /var/log/runix/audit.jsonl
+          line=$(sudo grep '"operation":"ci.probe"' /var/log/runix/audit.jsonl | tail -n1)
+          test -n "$line" || { echo "::error::no ci.probe record"; exit 1; }
+          # the record's actor must be the SO_PEERCRED uid (this runner), never root
+          runner=$(id -u)
+          echo "$line" | grep -Eq "\"(uid|actor)\":\"?${runner}\b" || {
+            echo "::error::record not attributed to the unprivileged caller (uid ${runner})"; echo "$line"; exit 1; }
+          echo "$line" | grep -Eq "\"(uid|actor)\":\"?0\b" && {
+            echo "::error::record wrongly attributed to root"; exit 1; } || true
+          echo "socket activation + unprivileged attribution + durable write confirmed"
+
+      - name: Assert the sandbox directives took effect
+        run: |
+          # ExecMainPID>0 means the service actually ran under systemd; the
+          # sandbox properties must be exactly what the unit declares.
+          sudo systemctl show runix-audit.service \
+            -p CapabilityBoundingSet -p ProtectSystem -p NoNewPrivileges \
+            -p RestrictAddressFamilies -p MemoryDenyWriteExecute | tee props
+          grep -qx 'CapabilityBoundingSet=' props
+          grep -qx 'ProtectSystem=strict' props
+          grep -qx 'NoNewPrivileges=yes' props
+          grep -q 'RestrictAddressFamilies=AF_UNIX' props
+          grep -qx 'MemoryDenyWriteExecute=yes' props

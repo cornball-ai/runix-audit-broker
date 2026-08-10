@@ -1,0 +1,1 @@
+{"type":"write_outcome","binding":"deadbeefdeadbeefdeadbeefdeadbeef","record":{"operation":"svc.restart","outcome":"ok","effect_issued":true,"changed":true,"elapsed":3}}

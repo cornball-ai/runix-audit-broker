@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+# Debian hardening (PIE, stack protector, FORTIFY, RELRO, etc.) is applied
+# via dpkg-buildflags, which the Makefile already consumes.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/runix-audit-broker PREFIX=/usr
+
+# Socket activation: enable the .socket only; the .service has no [Install]
+# and is pulled in on demand.
+override_dh_installsystemd:
+	dh_installsystemd --name=runix-audit runix-audit.socket

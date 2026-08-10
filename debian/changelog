@@ -1,0 +1,9 @@
+runix-audit-broker (0.0.1) unstable; urgency=medium
+
+  * Initial packaging: socket-activated audit broker. Versioned framing, the
+    hardened append sink, full SO_PEERCRED peer identity, the strict Jansson
+    parse/schema layer, the stateful broker (reconstruction, carry-forward
+    rotation, rate limits), and the socket-activation accept loop with
+    connection deadlines, all implemented and tested.
+
+ -- Troy Hernandez <troy@cornball.ai>  Sat, 08 Aug 2026 00:00:00 -0500

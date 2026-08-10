@@ -4,7 +4,18 @@
 *.so
 /build/
 /audit-broker
+/build-test-*
+/build-broker-asan
 /fuzz-proto
+/rab-probe
+# libFuzzer crash/leak artifacts (the seed corpus in fuzz/corpus is tracked)
+crash-*
+leak-*
+timeout-*
+oom-*
+# fuzzer-discovered corpus entries: keep only the curated *.json seeds
+fuzz/corpus/*
+!fuzz/corpus/*.json
 *.deb
 *.buildinfo
 *.changes
