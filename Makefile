@@ -28,14 +28,14 @@ PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec
 UNITDIR ?= /lib/systemd/system
 
-.PHONY: all test test-json test-broker test-socket check fuzz probe asan clean install
+.PHONY: all test test-json test-broker test-socket test-fixtures check fuzz probe asan clean install
 all: $(BIN)
 
 # One-shot client used by the activation gate: connect + send one open_intent.
 probe: tools/rab-probe.c src/proto.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o rab-probe $(LDFLAGS)
 
-check: test test-json test-broker test-socket
+check: test test-json test-broker test-socket test-fixtures
 
 # The full broker binary (needs libjansson-dev + the JSON/main sources).
 $(BIN): $(BROKER_SRC)
@@ -75,6 +75,15 @@ test-socket: build-broker-asan src/broker.c src/record.c src/json.c $(CORE) \
 	    $(CORE) tests/test_socket.c -o build-test-socket $(JSON_LIBS)
 	RAB_BROKER_BIN=./build-broker-asan ./build-test-socket
 
+# Cross-repo fixture cross-check: the broker's response builders + frame reader
+# against the SAME shared corpus the runix R adapter validates (vendored under
+# tests/fixtures/broker-frames/). Runs from the repo root so the fixture paths
+# resolve. Built with ASan/UBSan.
+test-fixtures: src/json.c src/proto.c tests/test_fixtures.c
+	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) \
+	    -fsanitize=address,undefined -g $^ -o build-test-fixtures $(JSON_LIBS)
+	./build-test-fixtures
+
 # Protocol/parser fuzzing. Requires clang (libFuzzer): invoke as
 # `make fuzz CC=clang`. Runs the request parser under the fuzzer + ASan/UBSan.
 fuzz: fuzz/fuzz_frame.c src/json.c
@@ -83,7 +92,8 @@ fuzz: fuzz/fuzz_frame.c src/json.c
 
 clean:
 	rm -f $(BIN) build-test-core build-test-json build-test-broker \
-	    build-test-socket build-broker-asan fuzz-proto rab-probe src/*.o
+	    build-test-socket build-test-fixtures build-broker-asan fuzz-proto \
+	    rab-probe src/*.o
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) \
