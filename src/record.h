@@ -46,12 +46,14 @@ char *rab_build_checkpoint(const char *correlation_id, const char *binding,
                            const char *scope);
 
 /* Build a `broker_rate` record line: the per-uid rate-window history carried
- * forward during rotation so the per-uid rate limit survives a restart (the
- * client audit records that seeded it move to the archive, which reconstruction
- * never reads). `times` are broker-assigned microsecond timestamps, only those
- * still inside the rate window at rotation time. Returns a malloc'd line or
- * NULL. */
-char *rab_build_rate(uid_t uid, const unsigned long long *times, size_t n);
+ * forward during rotation so the per-uid rate AND write-byte limits survive a
+ * restart (the client audit records that seeded them move to the archive, which
+ * reconstruction never reads). `times` are broker-assigned microsecond
+ * timestamps and `bytes` the appended size of each op (record + newline), one
+ * per timestamp, only those still inside the rate window at rotation time.
+ * Returns a malloc'd line or NULL. */
+char *rab_build_rate(uid_t uid, const unsigned long long *times,
+                     const unsigned long long *bytes, size_t n);
 
 typedef enum { RAB_REC_AUDIT, RAB_REC_CHECKPOINT, RAB_REC_RATE } rab_rec_type;
 
@@ -66,10 +68,12 @@ typedef struct {
     char operation[RAB_META_MAX]; /* open-intent metadata ("" if absent) */
     char resource[RAB_META_MAX];
     char scope[RAB_SCOPE_MAX];
-    /* RAB_REC_RATE only: a per-uid carry of rate-window timestamps. rate_times
-     * is malloc'd (NULL if none); free with rab_stored_free. */
+    /* RAB_REC_RATE only: a per-uid carry of rate-window timestamps and the
+     * appended byte size of each op. rate_times and rate_bytes are malloc'd
+     * (NULL if none), same length rate_n; free with rab_stored_free. */
     uid_t rate_uid;
     unsigned long long *rate_times;
+    unsigned long long *rate_bytes;
     size_t rate_n;
 } rab_stored;
 

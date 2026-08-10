@@ -16,6 +16,8 @@ typedef struct {
     unsigned max_open_global;        /* cap on total open intents */
     unsigned rate_window_sec;        /* per-uid op rate window (seconds) */
     unsigned rate_max_in_window;     /* max appended records/uid/window (0=off) */
+    unsigned long long rate_max_bytes_per_uid; /* max appended bytes/uid/window (0=off) */
+    unsigned long long rate_max_bytes_global;  /* max appended bytes/window, all uids (0=off) */
     unsigned long long rotate_bytes; /* rotate segment past this (0=never) */
     unsigned long long min_free_bytes; /* refuse appends below this fs free (0=off) */
     unsigned retain_segments;        /* max archived segments to keep (0=unlimited) */

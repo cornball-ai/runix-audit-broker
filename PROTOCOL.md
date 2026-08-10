@@ -155,6 +155,30 @@ protocol input.
 - A disconnect between `open_intent` and `write_outcome` leaves the intent as
   a durable, queryable **open** operation. It is never rolled back or erased.
 
+## Rate and write-byte quotas
+
+Independent of the connection limits, each accepted request is checked against
+per-actor write quotas before it is appended (`rate_limited` on refusal):
+
+- **Per-uid op count** — at most `rate_max_in_window` appended records per uid
+  per window (a sliding window of broker-assigned timestamps).
+- **Per-uid write bytes** — at most `rate_max_bytes_per_uid` appended bytes
+  (record + newline) per uid per window. This closes the flood the op-count
+  limit alone leaves open: at the op-count cap a caller could still write up to
+  that many 64 KiB frames. It shares the op ring (so it requires the op-count
+  limit to be enabled) and, like the op count, is **carried across rotation and
+  survives a restart** (see `broker_rate`).
+- **Global write bytes** — at most `rate_max_bytes_global` appended bytes per
+  window across all uids (a coarse total-volume ceiling). This one is a tumbling
+  window and is **not** persisted across a restart: the broker only idle-exits
+  after an idle period longer than the window, so there is no in-window global
+  state to carry, and a crash-restart merely resets a deliberately coarse
+  ceiling while the per-uid quotas (which do persist) still bound each caller.
+
+These bounds are process configuration, never protocol input. Retention (below)
+bounds what is kept *on disk*; these quotas bound what a caller may *write* in
+the first place — the two are not substitutes.
+
 ## On-disk segments, carry-forward, and retention
 
 These are broker-internal (not wire protocol), but they shape what a reader
@@ -166,11 +190,13 @@ finds on disk:
   segment to an archive (`<sink>.<microseconds>`), then atomically swaps the new
   segment into place. The current path is always the authoritative superset, so
   a crash mid-rotation never loses an open intent.
-- **Rate carry.** Rotation also writes one `broker_rate` record per active uid
-  into the new segment: the broker-assigned timestamps still inside the rate
-  window. The audit records that seeded the per-uid rate limit move to the
-  archive (which startup reconstruction never reads), so this carry is what
-  keeps the limit from resetting on the next restart.
+- **Rate/byte carry.** Rotation also writes one `broker_rate` record per active
+  uid into the new segment: the broker-assigned timestamp AND the appended byte
+  size of each op still inside the rate window (parallel `times_us` / `bytes`
+  arrays). The audit records that seeded the per-uid op-count rate limit and the
+  per-uid write-byte quota move to the archive (which startup reconstruction
+  never reads), so this carry is what keeps BOTH from resetting on the next
+  restart.
 - **Retention.** Total on-disk audit is bounded by both a segment count and a
   total byte budget (the active segment counts toward the bytes). The oldest
   archives are pruned first, and **only after** the new checkpointed segment is

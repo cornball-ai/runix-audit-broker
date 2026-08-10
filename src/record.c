@@ -155,28 +155,35 @@ char *rab_build_checkpoint(const char *correlation_id, const char *binding,
     return s;
 }
 
-char *rab_build_rate(uid_t uid, const unsigned long long *times, size_t n) {
+char *rab_build_rate(uid_t uid, const unsigned long long *times,
+                     const unsigned long long *bytes, size_t n) {
     json_t *root = json_object();
-    json_t *arr = json_array();
-    if (root == NULL || arr == NULL) {
+    json_t *tarr = json_array();
+    json_t *barr = json_array();
+    if (root == NULL || tarr == NULL || barr == NULL) {
         json_decref(root);
-        json_decref(arr);
+        json_decref(tarr);
+        json_decref(barr);
         return NULL;
     }
     int bad = 0;
     for (size_t i = 0; i < n; i++) {
-        char ts[24];
-        snprintf(ts, sizeof ts, "%llu", times[i]);
-        bad |= json_array_append_new(arr, json_string(ts));
+        char buf[24];
+        snprintf(buf, sizeof buf, "%llu", times[i]);
+        bad |= json_array_append_new(tarr, json_string(buf));
+        snprintf(buf, sizeof buf, "%llu", bytes[i]);
+        bad |= json_array_append_new(barr, json_string(buf));
     }
-    /* insertion order: schema_version, record_type, uid, times_us */
+    /* insertion order: schema_version, record_type, uid, times_us, bytes */
     bad |= json_object_set_new(root, "schema_version", json_integer(1));
     bad |= json_object_set_new(root, "record_type", json_string("broker_rate"));
     bad |= json_object_set_new(root, "uid", json_integer((json_int_t) uid));
     if (!bad) {
-        bad |= json_object_set_new(root, "times_us", arr); /* steals arr */
+        bad |= json_object_set_new(root, "times_us", tarr); /* steals tarr */
+        bad |= json_object_set_new(root, "bytes", barr);    /* steals barr */
     } else {
-        json_decref(arr);
+        json_decref(tarr);
+        json_decref(barr);
     }
     if (bad) {
         json_decref(root);
@@ -192,7 +199,9 @@ void rab_stored_free(rab_stored *out) {
         return;
     }
     free(out->rate_times);
+    free(out->rate_bytes);
     out->rate_times = NULL;
+    out->rate_bytes = NULL;
     out->rate_n = 0;
 }
 
@@ -325,32 +334,45 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
     } else if (strcmp(rts, "broker_rate") == 0) {
         /* broker-internal per-uid rate carry: a fixed, self-contained shape
          * with no correlation id and no broker extension. Validated exactly and
-         * handled here in full (it is not an open/close event). */
+         * handled here in full (it is not an open/close event). Carries the
+         * window timestamps and the appended byte size of each op, one-to-one. */
         static const char *const rk[] = {"schema_version", "record_type", "uid",
-                                         "times_us"};
-        if (!obj_only_keys(root, rk, 4)) {
+                                         "times_us", "bytes"};
+        if (!obj_only_keys(root, rk, 5)) {
             goto done;
         }
         json_t *juid = json_object_get(root, "uid");
         if (!json_is_integer(juid) || json_integer_value(juid) < 0) {
             goto done;
         }
-        json_t *arr = json_object_get(root, "times_us");
-        if (!json_is_array(arr)) {
+        json_t *tarr = json_object_get(root, "times_us");
+        json_t *barr = json_object_get(root, "bytes");
+        if (!json_is_array(tarr) || !json_is_array(barr)) {
             goto done;
         }
-        size_t n = json_array_size(arr);
+        size_t n = json_array_size(tarr);
+        if (json_array_size(barr) != n) {
+            goto done; /* times and bytes must correspond one-to-one */
+        }
         unsigned long long *times = NULL;
+        unsigned long long *bytes = NULL;
         if (n > 0) {
             times = malloc(n * sizeof *times);
-            if (times == NULL) {
+            bytes = malloc(n * sizeof *bytes);
+            if (times == NULL || bytes == NULL) {
+                free(times);
+                free(bytes);
                 goto done;
             }
             for (size_t i = 0; i < n; i++) {
-                json_t *el = json_array_get(arr, i);
-                if (!json_is_string(el) ||
-                    parse_u64_strict(json_string_value(el), &times[i]) != 0) {
+                json_t *te = json_array_get(tarr, i);
+                json_t *be = json_array_get(barr, i);
+                if (!json_is_string(te) ||
+                    parse_u64_strict(json_string_value(te), &times[i]) != 0 ||
+                    !json_is_string(be) ||
+                    parse_u64_strict(json_string_value(be), &bytes[i]) != 0) {
                     free(times);
+                    free(bytes);
                     goto done;
                 }
             }
@@ -358,6 +380,7 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
         out->type = RAB_REC_RATE;
         out->rate_uid = (uid_t) json_integer_value(juid);
         out->rate_times = times;
+        out->rate_bytes = bytes;
         out->rate_n = n;
         rc = 0;
         goto done;

@@ -336,7 +336,8 @@ static void test_record_schema(void) {
  * of malformed variants. */
 static void test_rate_record_parse(void) {
     unsigned long long times[] = {1700000000000000ull, 1700000000000005ull};
-    char *line = rab_build_rate(1000, times, 2);
+    unsigned long long bytes[] = {321ull, 654ull};
+    char *line = rab_build_rate(1000, times, bytes, 2);
     CHECK(line != NULL, "rate record built");
     if (line != NULL) {
         rab_stored s;
@@ -347,26 +348,38 @@ static void test_rate_record_parse(void) {
         CHECK(s.rate_times != NULL && s.rate_times[0] == times[0] &&
                   s.rate_times[1] == times[1],
               "rate timestamps round-trip");
+        CHECK(s.rate_bytes != NULL && s.rate_bytes[0] == bytes[0] &&
+                  s.rate_bytes[1] == bytes[1],
+              "rate bytes round-trip");
         rab_stored_free(&s);
         free(line);
     }
 
-    /* strict: non-string / non-decimal timestamps, extra keys, negative uid */
+    /* strict: a valid bytes array isolates each timestamp/shape defect */
     CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
-                     "\"uid\":1000,\"times_us\":[123]}"),
+                     "\"uid\":1000,\"times_us\":[123],\"bytes\":[\"10\"]}"),
           "non-string rate timestamp rejected");
     CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
-                     "\"uid\":1000,\"times_us\":[\"12x\"]}"),
+                     "\"uid\":1000,\"times_us\":[\"12x\"],\"bytes\":[\"10\"]}"),
           "non-decimal rate timestamp rejected");
     CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
-                     "\"uid\":1000,\"times_us\":[],\"x\":1}"),
+                     "\"uid\":1000,\"times_us\":[\"1\"],\"bytes\":[\"x\"]}"),
+          "non-decimal rate byte rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
+                     "\"uid\":1000,\"times_us\":[\"1\",\"2\"],\"bytes\":[\"10\"]}"),
+          "times/bytes length mismatch rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
+                     "\"uid\":1000,\"times_us\":[\"1\"]}"),
+          "missing bytes array rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
+                     "\"uid\":1000,\"times_us\":[],\"bytes\":[],\"x\":1}"),
           "extra key on rate record rejected");
     CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
-                     "\"uid\":-1,\"times_us\":[]}"),
+                     "\"uid\":-1,\"times_us\":[],\"bytes\":[]}"),
           "negative uid on rate record rejected");
     /* an empty carry is well-formed (a uid with no in-window history) */
     CHECK(parses_ok("{\"schema_version\":1,\"record_type\":\"broker_rate\","
-                    "\"uid\":1000,\"times_us\":[]}"),
+                    "\"uid\":1000,\"times_us\":[],\"bytes\":[]}"),
           "empty rate carry accepted");
 }
 
@@ -1334,6 +1347,250 @@ static void test_rate_window_boundary(void) {
     cleanup_dir(dir);
 }
 
+/* The per-uid write-byte quota bounds appended bytes/uid/window independently of
+ * the op count: with a high op-count limit, a flood is stopped by bytes, only
+ * that uid is affected, and the window slides. */
+static void test_byte_quota_per_uid(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rate_max_in_window = 1000;       /* op-count will not trip */
+    cfg.rate_max_bytes_per_uid = 1000;   /* a few records' worth */
+    cfg.rate_max_bytes_global = 0;       /* isolate the per-uid quota */
+    cfg.rate_window_sec = 100;
+    cfg.max_open_per_uid = 1000;
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    unsigned long long base = 2700000000000000ull;
+    unsigned long long window_us =
+        (unsigned long long) cfg.rate_window_sec * 1000000ull;
+    g_now = base;
+    g_step = 0;
+
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (byte quota per-uid)");
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX];
+    int ok_count = 0;
+    const char *code = "OK";
+    for (int i = 0; i < 50; i++) {
+        code = do_open(b, &a, bind, cid);
+        if (strcmp(code, "OK") != 0) {
+            break;
+        }
+        ok_count++;
+    }
+    CHECK(ok_count >= 1, "at least one op fits under the per-uid byte quota");
+    CHECK(ok_count < 50, "the per-uid byte quota stops the flood");
+    CHECK(strcmp(code, "rate_limited") == 0,
+          "over the per-uid byte quota is rate_limited");
+    /* a different uid is unaffected: the quota is per-uid */
+    rab_actor a2 = mk_actor(2000, 4321, "boot-abc", "555");
+    char b2[RAB_BINDING_STR_MAX], c2[RAB_CID_MAX];
+    CHECK(strcmp(do_open(b, &a2, b2, c2), "OK") == 0,
+          "a different uid is not blocked by another uid's byte quota");
+    /* advance past the window: the byte window slides, ops allowed again */
+    g_now = base + window_us + 1;
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0,
+          "per-uid byte window slides open after the window elapses");
+    rab_broker_close(b);
+    g_step = 1;
+    g_now = 1700000000000000ull;
+    cleanup_dir(dir);
+}
+
+/* The global write-byte quota spans uids: alternating callers, each under the
+ * (disabled) per-uid quota, together trip the global ceiling. */
+static void test_byte_quota_global(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rate_max_in_window = 1000;
+    cfg.rate_max_bytes_per_uid = 0;    /* off: only the global quota can bite */
+    cfg.rate_max_bytes_global = 1000;
+    cfg.rate_window_sec = 100;
+    cfg.max_open_per_uid = 1000;
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    rab_actor a2 = mk_actor(2000, 4321, "boot-abc", "555");
+    unsigned long long base = 2900000000000000ull;
+    unsigned long long window_us =
+        (unsigned long long) cfg.rate_window_sec * 1000000ull;
+    g_now = base;
+    g_step = 0;
+
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (byte quota global)");
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX];
+    int ok_count = 0;
+    const char *code = "OK";
+    for (int i = 0; i < 50; i++) {
+        code = do_open(b, (i % 2 == 0) ? &a : &a2, bind, cid);
+        if (strcmp(code, "OK") != 0) {
+            break;
+        }
+        ok_count++;
+    }
+    CHECK(ok_count >= 1, "at least one op fits under the global byte quota");
+    CHECK(ok_count < 50, "the global byte quota stops a cross-uid flood");
+    CHECK(strcmp(code, "rate_limited") == 0,
+          "over the global byte quota is rate_limited");
+    /* advance past the window: the tumbling global window rolls over */
+    g_now = base + window_us + 1;
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0,
+          "global byte window rolls over after the window elapses");
+    rab_broker_close(b);
+    g_step = 1;
+    g_now = 1700000000000000ull;
+    cleanup_dir(dir);
+}
+
+/* The per-uid byte quota survives rotation + restart: a small rotate_bytes
+ * forces the seeding audit records into archives, so only the byte history
+ * carried in broker_rate keeps the quota tripped across the restart. */
+static void test_byte_quota_survives_rotation(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rate_max_in_window = 1000;
+    cfg.rate_max_bytes_per_uid = 1500;
+    cfg.rate_max_bytes_global = 0;
+    cfg.rate_window_sec = 100;
+    cfg.rotate_bytes = 256;   /* rotate each op: seeders move to archives */
+    cfg.max_open_per_uid = 1000;
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    unsigned long long base = 3100000000000000ull;
+    unsigned long long window_us =
+        (unsigned long long) cfg.rate_window_sec * 1000000ull;
+    g_now = base;
+    g_step = 1;
+
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (byte quota rotation)");
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX];
+    int ok_count = 0;
+    const char *code = "OK";
+    for (int i = 0; i < 50; i++) {
+        code = do_open(b, &a, bind, cid);
+        if (strcmp(code, "OK") != 0) {
+            break;
+        }
+        ok_count++;
+    }
+    CHECK(ok_count >= 1, "at least one op fits before the byte quota trips");
+    CHECK(strcmp(code, "rate_limited") == 0, "byte quota trips before restart");
+    CHECK(count_archives(dir, "audit.jsonl") >= 1,
+          "rotation happened (seeders archived)");
+    rab_broker_close(b);
+
+    /* restart within the window: byte history reseeded from broker_rate carries */
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "reopen (byte quota survives)");
+    CHECK(strcmp(do_open(b, &a, bind, cid), "rate_limited") == 0,
+          "per-uid byte quota survived rotation + restart");
+    rab_broker_close(b);
+
+    /* well past the window: the carried bytes age out, ops allowed */
+    g_now = base + window_us + 1000000ull;
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "reopen (byte quota, after window)");
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0,
+          "byte window slides open once the carried window elapses");
+    rab_broker_close(b);
+    g_step = 1;
+    g_now = 1700000000000000ull;
+    cleanup_dir(dir);
+}
+
+/* A per-uid byte quota needs the op-count limit (which bounds the ring); the
+ * combination without it is rejected at open. */
+static void test_byte_quota_config(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rate_max_bytes_per_uid = 1000;
+    cfg.rate_max_in_window = 0; /* invalid: unbounded ring */
+    const char *err = NULL;
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b == NULL, "per-uid byte quota without an op-count limit is rejected");
+    CHECK(err != NULL, "config rejection sets err");
+    cleanup_dir(dir);
+}
+
+/* Many open intents exercise the hash tables (collisions, chain unlink) and
+ * reconstruction at a scale the old linked-list scan made O(n^2). */
+static void test_hashed_scale(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rate_max_in_window = 0;      /* op-count off: unbounded ops */
+    cfg.rate_max_bytes_per_uid = 0;  /* off (would else require op-count) */
+    cfg.rate_max_bytes_global = 0;   /* off */
+    cfg.max_open_per_uid = 100000;
+    cfg.max_open_global = 100000;
+    cfg.rotate_bytes = 0;            /* no rotation: pure open-set scale */
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    g_now = 2800000000000000ull;
+    g_step = 1;
+
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (scale)");
+    enum { N = 2000 };
+    char (*binds)[RAB_BINDING_STR_MAX] = malloc(N * sizeof *binds);
+    char (*cids)[RAB_CID_MAX] = malloc(N * sizeof *cids);
+    CHECK(binds != NULL && cids != NULL, "scale arrays allocated");
+    if (binds != NULL && cids != NULL) {
+        int all_ok = 1;
+        for (int i = 0; i < N; i++) {
+            if (strcmp(do_open(b, &a, binds[i], cids[i]), "OK") != 0) {
+                all_ok = 0;
+            }
+        }
+        CHECK(all_ok, "N opens all succeed");
+        CHECK(rab_broker_open_count(b) == (size_t) N, "all N intents open");
+        int found = 0;
+        for (int i = 0; i < N; i++) {
+            if (rab_broker_has_open(b, cids[i])) {
+                found++;
+            }
+        }
+        CHECK(found == N, "every cid resolves via the by-cid hash");
+        int closed = 0;
+        for (int i = 0; i < N; i++) {
+            if (strcmp(do_outcome(b, &a, binds[i]), "OK") == 0) {
+                closed++;
+            }
+        }
+        CHECK(closed == N, "every intent closes via its binding (by-bind hash)");
+        CHECK(rab_broker_open_count(b) == 0, "open set empty after closing all");
+        rab_broker_close(b);
+
+        /* reconstruct the whole 2N-record segment cleanly */
+        b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL && rab_broker_open_count(b) == 0,
+              "reconstruction of 2N records is consistent and empty");
+        rab_broker_close(b);
+    } else if (b != NULL) {
+        rab_broker_close(b);
+    }
+    free(binds);
+    free(cids);
+    g_step = 1;
+    g_now = 1700000000000000ull;
+    cleanup_dir(dir);
+}
+
 int main(void) {
     test_record_schema();
     test_rate_record_parse();
@@ -1353,6 +1610,11 @@ int main(void) {
     test_retention_bounds();
     test_retention_symlink_safety();
     test_rate_window_boundary();
+    test_byte_quota_per_uid();
+    test_byte_quota_global();
+    test_byte_quota_survives_rotation();
+    test_byte_quota_config();
+    test_hashed_scale();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

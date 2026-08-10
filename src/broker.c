@@ -21,8 +21,16 @@
  * backstop when rotation is disabled. */
 #define RAB_MAX_SEGMENT_BYTES (1024ull * 1024ull * 1024ull) /* 1 GiB */
 
+/* Upper bound on any hash table's bucket count (memory backstop). */
+#define RAB_MAX_BUCKETS ((size_t) 1 << 20)
+
 /* ---- state ------------------------------------------------------------- */
 
+/* Open intents are held in two hash tables over the SAME nodes: by cid (for
+ * reconstruction and existence checks) and by binding (for outcome matching).
+ * Both were linked-list scans before; at the 32768-intent cap that made every
+ * lookup O(n) and reconstruction O(n^2). The tables share nbkt (a power of two)
+ * so a single mask indexes both. */
 typedef struct intent {
     char cid[RAB_CID_MAX];
     char binding[RAB_BINDING_MAX];
@@ -30,15 +38,23 @@ typedef struct intent {
     char operation[RAB_META_MAX]; /* retained so a checkpoint stays meaningful */
     char resource[RAB_META_MAX];
     char scope[RAB_SCOPE_MAX];
-    struct intent *next;
+    struct intent *hcid;  /* chain in the by-cid table */
+    struct intent *hbind; /* chain in the by-binding table */
 } intent;
 
+/* Per-uid accounting: a sliding window of recent ops as a FIFO ring of
+ * (timestamp, appended-bytes) with a running byte sum and lazy eviction, so the
+ * op-count (n) and the in-window byte total (bsum) are both O(1) to read after
+ * eviction. The op-count bounds the ring, so a per-uid BYTE quota requires the
+ * op-count limit to be on (validated at open). */
 typedef struct uid_state {
     uid_t uid;
     unsigned open;              /* current open intents for this uid */
-    unsigned long long *ring;   /* recent appended-record times (us) */
-    unsigned cap, n, head;      /* ring buffer bookkeeping */
-    struct uid_state *next;
+    unsigned long long *ts;     /* ring of op timestamps (us) */
+    unsigned long long *bytes;  /* parallel ring of appended sizes */
+    unsigned cap, n, head;      /* FIFO: entries at [head, head+n) mod cap */
+    unsigned long long bsum;    /* running sum of bytes currently in the ring */
+    struct uid_state *hnext;    /* chain in the by-uid table */
 } uid_state;
 
 struct rab_broker {
@@ -48,9 +64,18 @@ struct rab_broker {
     rab_clock_fn clock;
     void *clock_ctx;
     char host[256];
-    intent *open;
+    /* open-intent hash tables (share nbkt) */
+    intent **bkt_cid;
+    intent **bkt_bind;
+    size_t nbkt;
     size_t open_count;
-    uid_state *uids;
+    /* per-uid accounting hash table */
+    uid_state **bkt_uid;
+    size_t nbkt_uid;
+    /* global write-byte quota: a tumbling window (O(1); does not persist across
+     * a restart, unlike the per-uid quota — see global_bytes_note). */
+    unsigned long long g_win_start;
+    unsigned long long g_win_bytes;
     unsigned long long seg_bytes;
     int poisoned; /* a partial append / fsync uncertainty: refuse until restart */
 };
@@ -60,6 +85,8 @@ void rab_config_defaults(rab_config *cfg) {
     cfg->max_open_global = 32768;
     cfg->rate_window_sec = 10;
     cfg->rate_max_in_window = 2000;
+    cfg->rate_max_bytes_per_uid = 16ull << 20; /* 16 MiB/uid/window */
+    cfg->rate_max_bytes_global = 64ull << 20;  /* 64 MiB/window, all uids */
     cfg->rotate_bytes = 64ull << 20;    /* 64 MiB current-segment cap */
     cfg->min_free_bytes = 64ull << 20;  /* refuse appends below 64 MiB free */
     cfg->retain_segments = 16;          /* keep at most 16 archived segments */
@@ -76,10 +103,37 @@ static unsigned long long real_clock(void *ctx) {
            (unsigned long long) (ts.tv_nsec / 1000);
 }
 
-/* ---- per-uid rate/quota accounting ------------------------------------- */
+/* ---- hashing ----------------------------------------------------------- */
+
+static size_t pow2_ceil(size_t x) {
+    size_t p = 16;
+    while (p < x && p < RAB_MAX_BUCKETS) {
+        p <<= 1;
+    }
+    return p;
+}
+
+/* FNV-1a over a NUL-terminated string. Callers mask with (nbkt - 1). */
+static size_t hstr(const char *s) {
+    unsigned long long h = 1469598103934665603ull;
+    for (; *s != '\0'; s++) {
+        h ^= (unsigned char) *s;
+        h *= 1099511628211ull;
+    }
+    return (size_t) h;
+}
+
+/* Integer mix for uids. Callers mask with (nbkt_uid - 1). */
+static size_t huid(uid_t uid) {
+    unsigned long long h = (unsigned long long) uid * 11400714819323198485ull;
+    return (size_t) (h >> 29);
+}
+
+/* ---- per-uid rate/byte accounting -------------------------------------- */
 
 static uid_state *uid_find(rab_broker *b, uid_t uid) {
-    for (uid_state *u = b->uids; u != NULL; u = u->next) {
+    for (uid_state *u = b->bkt_uid[huid(uid) & (b->nbkt_uid - 1)]; u != NULL;
+         u = u->hnext) {
         if (u->uid == uid) {
             return u;
         }
@@ -97,39 +151,58 @@ static uid_state *uid_get(rab_broker *b, uid_t uid) {
         return NULL;
     }
     unsigned cap = b->cfg.rate_max_in_window ? b->cfg.rate_max_in_window : 1;
-    u->ring = calloc(cap, sizeof *u->ring);
-    if (u->ring == NULL) {
+    u->ts = calloc(cap, sizeof *u->ts);
+    u->bytes = calloc(cap, sizeof *u->bytes);
+    if (u->ts == NULL || u->bytes == NULL) {
+        free(u->ts);
+        free(u->bytes);
         free(u);
         return NULL;
     }
     u->uid = uid;
     u->cap = cap;
-    u->next = b->uids;
-    b->uids = u;
+    size_t h = huid(uid) & (b->nbkt_uid - 1);
+    u->hnext = b->bkt_uid[h];
+    b->bkt_uid[h] = u;
     return u;
 }
 
-static void ring_push(uid_state *u, unsigned long long t) {
-    if (u->n < u->cap) {
-        u->ring[(u->head + u->n) % u->cap] = t;
-        u->n++;
-    } else {
-        u->ring[u->head] = t;
+/* The in-window threshold: an op counts iff its timestamp is >= now - window
+ * (inclusive boundary). */
+static unsigned long long win_th(const rab_broker *b, unsigned long long now) {
+    unsigned long long window =
+        (unsigned long long) b->cfg.rate_window_sec * 1000000ull;
+    return (now > window) ? now - window : 0;
+}
+
+/* Drop entries older than the window (ts < th) from the FIFO front, keeping the
+ * running byte sum in step. */
+static void uid_evict(uid_state *u, unsigned long long th) {
+    while (u->n > 0 && u->ts[u->head] < th) {
+        u->bsum -= u->bytes[u->head];
         u->head = (u->head + 1) % u->cap;
+        u->n--;
     }
 }
 
-static unsigned ring_count_since(const uid_state *u, unsigned long long th) {
-    unsigned c = 0;
-    for (unsigned i = 0; i < u->n; i++) {
-        if (u->ring[(u->head + i) % u->cap] >= th) {
-            c++;
-        }
+static void uid_push(uid_state *u, unsigned long long t,
+                     unsigned long long nbytes) {
+    if (u->n == u->cap) {
+        /* Overflow guard: cannot happen while the op-count limit holds (a push
+         * follows a passed rate check), but a reconstruction over a shrunken
+         * cap could. Evict the oldest, keeping the newest cap entries. */
+        u->bsum -= u->bytes[u->head];
+        u->head = (u->head + 1) % u->cap;
+        u->n--;
     }
-    return c;
+    unsigned idx = (u->head + u->n) % u->cap;
+    u->ts[idx] = t;
+    u->bytes[idx] = nbytes;
+    u->bsum += nbytes;
+    u->n++;
 }
 
-/* 1 if a new op is within the per-uid rate, 0 if it should be rejected. */
+/* 1 if a new op is within the per-uid op-count rate, 0 to reject. */
 static int rate_allowed(rab_broker *b, uid_t uid, unsigned long long now) {
     if (b->cfg.rate_max_in_window == 0) {
         return 1;
@@ -138,29 +211,74 @@ static int rate_allowed(rab_broker *b, uid_t uid, unsigned long long now) {
     if (u == NULL) {
         return 0; /* allocation failure: fail closed */
     }
-    unsigned long long window =
-        (unsigned long long) b->cfg.rate_window_sec * 1000000ull;
-    unsigned long long th = (now > window) ? now - window : 0;
-    return ring_count_since(u, th) < b->cfg.rate_max_in_window;
+    uid_evict(u, win_th(b, now));
+    return u->n < b->cfg.rate_max_in_window;
 }
 
-static void rate_note(rab_broker *b, uid_t uid, unsigned long long t) {
+/* 1 if appending `nbytes` stays within BOTH the per-uid and global write-byte
+ * quotas, 0 to reject. Read-only: the counters advance in the note calls after
+ * a successful append. */
+static int bytes_allowed(rab_broker *b, uid_t uid, unsigned long long now,
+                         unsigned long long nbytes) {
+    if (b->cfg.rate_max_bytes_per_uid != 0) {
+        uid_state *u = uid_get(b, uid);
+        if (u == NULL) {
+            return 0;
+        }
+        uid_evict(u, win_th(b, now));
+        if (u->bsum + nbytes > b->cfg.rate_max_bytes_per_uid) {
+            return 0;
+        }
+    }
+    if (b->cfg.rate_max_bytes_global != 0) {
+        unsigned long long window =
+            (unsigned long long) b->cfg.rate_window_sec * 1000000ull;
+        unsigned long long cur =
+            (now - b->g_win_start >= window) ? 0 : b->g_win_bytes;
+        if (cur + nbytes > b->cfg.rate_max_bytes_global) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Record one accepted op in the per-uid window (op count + bytes). Also used by
+ * reconstruction to reseed the ring, which is why it does NOT touch the global
+ * tumbling counter (that one does not persist across a restart). */
+static void rate_note(rab_broker *b, uid_t uid, unsigned long long t,
+                      unsigned long long nbytes) {
     if (b->cfg.rate_max_in_window == 0) {
-        return;
+        return; /* the ring only exists when the op-count limit is on */
     }
     uid_state *u = uid_get(b, uid);
     if (u != NULL) {
-        ring_push(u, t);
+        uid_push(u, t, nbytes);
     }
 }
 
-/* ---- open-intent set --------------------------------------------------- */
+/* Advance the global tumbling window. Live path only. */
+static void global_bytes_note(rab_broker *b, unsigned long long now,
+                              unsigned long long nbytes) {
+    if (b->cfg.rate_max_bytes_global == 0) {
+        return;
+    }
+    unsigned long long window =
+        (unsigned long long) b->cfg.rate_window_sec * 1000000ull;
+    if (b->g_win_start == 0 || now - b->g_win_start >= window) {
+        b->g_win_start = now;
+        b->g_win_bytes = 0;
+    }
+    b->g_win_bytes += nbytes;
+}
+
+/* ---- open-intent set (two hash tables) --------------------------------- */
 
 static intent *open_find_binding(rab_broker *b, const char *binding) {
     if (binding[0] == '\0') {
         return NULL;
     }
-    for (intent *it = b->open; it != NULL; it = it->next) {
+    for (intent *it = b->bkt_bind[hstr(binding) & (b->nbkt - 1)]; it != NULL;
+         it = it->hbind) {
         if (strcmp(it->binding, binding) == 0) {
             return it;
         }
@@ -169,7 +287,8 @@ static intent *open_find_binding(rab_broker *b, const char *binding) {
 }
 
 static intent *open_find_cid(rab_broker *b, const char *cid) {
-    for (intent *it = b->open; it != NULL; it = it->next) {
+    for (intent *it = b->bkt_cid[hstr(cid) & (b->nbkt - 1)]; it != NULL;
+         it = it->hcid) {
         if (strcmp(it->cid, cid) == 0) {
             return it;
         }
@@ -187,11 +306,16 @@ static int open_add(rab_broker *b, const char *cid, const char *binding,
     snprintf(it->cid, sizeof it->cid, "%s", cid);
     snprintf(it->binding, sizeof it->binding, "%s", binding);
     it->actor = *actor;
-    snprintf(it->operation, sizeof it->operation, "%s", operation ? operation : "");
+    snprintf(it->operation, sizeof it->operation, "%s",
+             operation ? operation : "");
     snprintf(it->resource, sizeof it->resource, "%s", resource ? resource : "");
     snprintf(it->scope, sizeof it->scope, "%s", scope ? scope : "");
-    it->next = b->open;
-    b->open = it;
+    size_t hc = hstr(cid) & (b->nbkt - 1);
+    it->hcid = b->bkt_cid[hc];
+    b->bkt_cid[hc] = it;
+    size_t hb = hstr(binding) & (b->nbkt - 1);
+    it->hbind = b->bkt_bind[hb];
+    b->bkt_bind[hb] = it;
     b->open_count++;
     uid_state *u = uid_get(b, actor->uid);
     if (u != NULL) {
@@ -201,20 +325,28 @@ static int open_add(rab_broker *b, const char *cid, const char *binding,
 }
 
 static void open_remove(rab_broker *b, intent *target) {
-    intent **pp = &b->open;
+    intent **pp = &b->bkt_cid[hstr(target->cid) & (b->nbkt - 1)];
     while (*pp != NULL) {
         if (*pp == target) {
-            *pp = target->next;
-            b->open_count--;
-            uid_state *u = uid_find(b, target->actor.uid);
-            if (u != NULL && u->open > 0) {
-                u->open--;
-            }
-            free(target);
-            return;
+            *pp = target->hcid;
+            break;
         }
-        pp = &(*pp)->next;
+        pp = &(*pp)->hcid;
     }
+    pp = &b->bkt_bind[hstr(target->binding) & (b->nbkt - 1)];
+    while (*pp != NULL) {
+        if (*pp == target) {
+            *pp = target->hbind;
+            break;
+        }
+        pp = &(*pp)->hbind;
+    }
+    b->open_count--;
+    uid_state *u = uid_find(b, target->actor.uid);
+    if (u != NULL && u->open > 0) {
+        u->open--;
+    }
+    free(target);
 }
 
 /* ---- append + carry-forward rotation ----------------------------------- */
@@ -249,49 +381,48 @@ static int append_line(rab_broker *b, const char *line) {
     return 0;
 }
 
-/* Carry the per-uid rate-window history into the new segment during rotation:
- * for each uid, the broker-assigned timestamps still inside the rate window
- * (only those; older ones are already irrelevant). The client audit records
- * that seeded the ring move to an archive that reconstruction never reads, so
- * without this the per-uid rate limit would reset at the next restart. Bounded
- * by the ring cap. Returns 0, or -1 on a write/alloc failure (rotation is then
- * aborted, leaving the current segment valid). */
+/* Carry the per-uid rate+byte window history into the new segment during
+ * rotation: for each uid, the (timestamp, bytes) of every op still inside the
+ * window. The client audit records that seeded the ring move to an archive that
+ * reconstruction never reads, so without this the per-uid rate AND byte limits
+ * would reset at the next restart. Bounded by the ring cap. Returns 0, or -1 on
+ * a write/alloc failure (rotation is then aborted, leaving the segment valid). */
 static int write_rate_carries(rab_broker *b, int fd) {
     if (b->cfg.rate_max_in_window == 0) {
         return 0;
     }
-    unsigned long long now = b->clock(b->clock_ctx);
-    unsigned long long window =
-        (unsigned long long) b->cfg.rate_window_sec * 1000000ull;
-    unsigned long long th = (now > window) ? now - window : 0;
-    for (uid_state *u = b->uids; u != NULL; u = u->next) {
-        if (u->n == 0) {
-            continue;
-        }
-        unsigned long long *tmp = malloc((size_t) u->n * sizeof *tmp);
-        if (tmp == NULL) {
-            return -1;
-        }
-        size_t k = 0;
-        for (unsigned i = 0; i < u->n; i++) {
-            unsigned long long t = u->ring[(u->head + i) % u->cap];
-            if (t >= th) { /* only timestamps still inside the rate window */
-                tmp[k++] = t;
+    unsigned long long th = win_th(b, b->clock(b->clock_ctx));
+    for (size_t i = 0; i < b->nbkt_uid; i++) {
+        for (uid_state *u = b->bkt_uid[i]; u != NULL; u = u->hnext) {
+            uid_evict(u, th);
+            if (u->n == 0) {
+                continue;
             }
-        }
-        int rc = 0;
-        if (k > 0) {
-            char *line = rab_build_rate(u->uid, tmp, k);
+            unsigned long long *ct = malloc((size_t) u->n * sizeof *ct);
+            unsigned long long *cb = malloc((size_t) u->n * sizeof *cb);
+            if (ct == NULL || cb == NULL) {
+                free(ct);
+                free(cb);
+                return -1;
+            }
+            for (unsigned k = 0; k < u->n; k++) {
+                unsigned idx = (u->head + k) % u->cap;
+                ct[k] = u->ts[idx];
+                cb[k] = u->bytes[idx];
+            }
+            char *line = rab_build_rate(u->uid, ct, cb, u->n);
+            int rc = 0;
             if (line == NULL) {
                 rc = -1;
             } else {
                 rc = rab_sink_append(fd, line, strlen(line));
                 free(line);
             }
-        }
-        free(tmp);
-        if (rc != 0) {
-            return -1;
+            free(ct);
+            free(cb);
+            if (rc != 0) {
+                return -1;
+            }
         }
     }
     return 0;
@@ -476,19 +607,21 @@ static int rotate(rab_broker *b) {
         return -1;
     }
     int rc = 0;
-    for (intent *it = b->open; it != NULL && rc == 0; it = it->next) {
-        unsigned long long now = b->clock(b->clock_ctx);
-        char *line = rab_build_checkpoint(it->cid, it->binding, &it->actor, now,
-                                          it->operation, it->resource,
-                                          it->scope);
-        if (line == NULL) {
-            rc = -1;
-            break;
+    for (size_t i = 0; i < b->nbkt && rc == 0; i++) {
+        for (intent *it = b->bkt_cid[i]; it != NULL && rc == 0; it = it->hcid) {
+            unsigned long long now = b->clock(b->clock_ctx);
+            char *line = rab_build_checkpoint(it->cid, it->binding, &it->actor,
+                                              now, it->operation, it->resource,
+                                              it->scope);
+            if (line == NULL) {
+                rc = -1;
+                break;
+            }
+            if (rab_sink_append(pfd, line, strlen(line)) != 0) {
+                rc = -1;
+            }
+            free(line);
         }
-        if (rab_sink_append(pfd, line, strlen(line)) != 0) {
-            rc = -1;
-        }
-        free(line);
     }
     if (rc != 0) {
         close(pfd);
@@ -621,6 +754,12 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
     if (line == NULL) {
         return reply(resp, rab_response_error("internal", "record build"));
     }
+    unsigned long long nbytes = (unsigned long long) strlen(line) + 1;
+    if (!bytes_allowed(b, actor->uid, now, nbytes)) {
+        free(line);
+        return reply(resp, rab_response_error("rate_limited",
+                                              "write-byte quota exceeded"));
+    }
     if (append_line(b, line) != 0) {
         free(line);
         return reply(resp,
@@ -632,7 +771,8 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
          * instance cannot cache it; fail closed rather than lie. */
         return reply(resp, rab_response_error("internal", "open-set alloc"));
     }
-    rate_note(b, actor->uid, now);
+    rate_note(b, actor->uid, now, nbytes);
+    global_bytes_note(b, now, nbytes);
     maybe_rotate(b);
     if (b->poisoned) {
         /* rotation left the segment's durability uncertain: do not hand back a
@@ -670,6 +810,12 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
     if (line == NULL) {
         return reply(resp, rab_response_error("internal", "record build"));
     }
+    unsigned long long nbytes = (unsigned long long) strlen(line) + 1;
+    if (!bytes_allowed(b, actor->uid, now, nbytes)) {
+        free(line);
+        return reply(resp, rab_response_error("rate_limited",
+                                              "write-byte quota exceeded"));
+    }
     if (append_line(b, line) != 0) {
         free(line);
         return reply(resp,
@@ -677,7 +823,8 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
     }
     free(line);
     open_remove(b, it); /* single-use: the outcome closes the intent */
-    rate_note(b, actor->uid, now);
+    rate_note(b, actor->uid, now, nbytes);
+    global_bytes_note(b, now, nbytes);
     maybe_rotate(b);
     if (b->poisoned) {
         return reply(resp, rab_response_error(
@@ -689,9 +836,9 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
 
 /* A single non-effect record (preview / no-op). It mints a correlation id but
  * opens no intent and returns no binding, so it can never be paired with a
- * write_outcome. It is rate/free-space/rotation-poison accounted exactly like
- * the effect paths. The phase (preview|noop) and the non-effect record were
- * already constrained by the parser, so this cannot be a generic append. */
+ * write_outcome. It is rate/byte/free-space/rotation-poison accounted exactly
+ * like the effect paths. The phase (preview|noop) and the non-effect record
+ * were already constrained by the parser, so this cannot be a generic append. */
 static int handle_emit(rab_broker *b, const rab_actor *actor,
                        const rab_request *req, char **resp) {
     unsigned long long now = b->clock(b->clock_ctx);
@@ -712,13 +859,20 @@ static int handle_emit(rab_broker *b, const rab_actor *actor,
     if (line == NULL) {
         return reply(resp, rab_response_error("internal", "record build"));
     }
+    unsigned long long nbytes = (unsigned long long) strlen(line) + 1;
+    if (!bytes_allowed(b, actor->uid, now, nbytes)) {
+        free(line);
+        return reply(resp, rab_response_error("rate_limited",
+                                              "write-byte quota exceeded"));
+    }
     if (append_line(b, line) != 0) {
         free(line);
         return reply(resp,
                      rab_response_error("persist_failed", "sink append failed"));
     }
     free(line);
-    rate_note(b, actor->uid, now);
+    rate_note(b, actor->uid, now, nbytes);
+    global_bytes_note(b, now, nbytes);
     maybe_rotate(b);
     if (b->poisoned) {
         return reply(resp, rab_response_error(
@@ -751,45 +905,67 @@ int rab_broker_handle(rab_broker *b, const rab_actor *actor,
 
 /* ---- startup reconstruction -------------------------------------------- */
 
-/* temporary set of closed correlation ids, for detecting double outcomes and
- * carry-forward of an already-closed intent during reconstruction. */
+/* Hashed set of closed correlation ids, for detecting double outcomes and the
+ * carry-forward of an already-closed intent during reconstruction. A linked
+ * list here was the other half of the O(n^2): a lookup per record. */
 typedef struct cidnode {
     char cid[RAB_CID_MAX];
-    struct cidnode *next;
+    struct cidnode *hnext;
 } cidnode;
 
-static int cid_in_list(const cidnode *l, const char *cid) {
-    for (; l != NULL; l = l->next) {
-        if (strcmp(l->cid, cid) == 0) {
+typedef struct {
+    cidnode **bkt;
+    size_t nbkt;
+} cidset;
+
+static int cidset_init(cidset *s, size_t hint) {
+    s->nbkt = pow2_ceil(hint < 1024 ? 1024 : hint);
+    s->bkt = calloc(s->nbkt, sizeof *s->bkt);
+    return s->bkt != NULL ? 0 : -1;
+}
+
+static int cidset_has(const cidset *s, const char *cid) {
+    for (cidnode *n = s->bkt[hstr(cid) & (s->nbkt - 1)]; n != NULL;
+         n = n->hnext) {
+        if (strcmp(n->cid, cid) == 0) {
             return 1;
         }
     }
     return 0;
 }
 
-static int cid_add(cidnode **l, const char *cid) {
+static int cidset_add(cidset *s, const char *cid) {
+    size_t h = hstr(cid) & (s->nbkt - 1);
     cidnode *n = calloc(1, sizeof *n);
     if (n == NULL) {
         return -1;
     }
     snprintf(n->cid, sizeof n->cid, "%s", cid);
-    n->next = *l;
-    *l = n;
+    n->hnext = s->bkt[h];
+    s->bkt[h] = n;
     return 0;
 }
 
-static void cid_free(cidnode *l) {
-    while (l != NULL) {
-        cidnode *n = l->next;
-        free(l);
-        l = n;
+static void cidset_free(cidset *s) {
+    if (s->bkt == NULL) {
+        return;
     }
+    for (size_t i = 0; i < s->nbkt; i++) {
+        cidnode *n = s->bkt[i];
+        while (n != NULL) {
+            cidnode *x = n->hnext;
+            free(n);
+            n = x;
+        }
+    }
+    free(s->bkt);
+    s->bkt = NULL;
 }
 
 /* Apply one reconstructed record to the open-set. Returns NULL on success or a
  * static error string on an inconsistency (fail closed). */
 static const char *apply_stored(rab_broker *b, const rab_stored *s,
-                                cidnode **closed) {
+                                cidset *closed) {
     /* An intent (audit) or a carry-forward (broker_checkpoint) opens the cid. */
     int is_intent = (s->type == RAB_REC_AUDIT &&
                      strcmp(s->phase, RAB_PHASE_INTENT) == 0);
@@ -811,7 +987,7 @@ static const char *apply_stored(rab_broker *b, const rab_stored *s,
             }
             return NULL; /* idempotent */
         }
-        if (cid_in_list(*closed, s->correlation_id)) {
+        if (cidset_has(closed, s->correlation_id)) {
             return is_intent ? "duplicate intent for a closed operation"
                              : "checkpoint of a closed operation";
         }
@@ -825,12 +1001,12 @@ static const char *apply_stored(rab_broker *b, const rab_stored *s,
         strcmp(s->phase, RAB_PHASE_OUTCOME) == 0) {
         intent *it = open_find_cid(b, s->correlation_id);
         if (it == NULL) {
-            return cid_in_list(*closed, s->correlation_id)
+            return cidset_has(closed, s->correlation_id)
                        ? "double outcome"
                        : "outcome without a matching intent";
         }
         open_remove(b, it);
-        if (cid_add(closed, s->correlation_id) != 0) {
+        if (cidset_add(closed, s->correlation_id) != 0) {
             return "out of memory during reconstruction";
         }
         return NULL;
@@ -922,7 +1098,14 @@ static int reconstruct(rab_broker *b, const char **err) {
     if (slurp_segment(b->path, &buf, &total, err) != 0) {
         return -1;
     }
-    cidnode *closed = NULL;
+    cidset closed;
+    /* size the closed set from the segment: ~one record per 128 bytes is a
+     * generous over-estimate that keeps chains short without a huge table. */
+    if (cidset_init(&closed, total / 128) != 0) {
+        free(buf);
+        *err = "out of memory sizing reconstruction state";
+        return -1;
+    }
     int rc = 0;
     int torn = 0;
     size_t keep_bytes = 0;
@@ -947,11 +1130,11 @@ static int reconstruct(rab_broker *b, const char **err) {
                 break;
             }
             if (s.type == RAB_REC_RATE) {
-                /* per-uid rate history carried across a rotation: reseed the
-                 * ring so the limit survives a restart (the audit records that
-                 * seeded it are in an archive we do not read). */
+                /* per-uid rate+byte history carried across a rotation: reseed
+                 * the ring so both limits survive a restart (the audit records
+                 * that seeded them are in an archive we do not read). */
                 for (size_t i = 0; i < s.rate_n; i++) {
-                    rate_note(b, s.rate_uid, s.rate_times[i]);
+                    rate_note(b, s.rate_uid, s.rate_times[i], s.rate_bytes[i]);
                 }
                 rab_stored_free(&s);
             } else {
@@ -963,9 +1146,11 @@ static int reconstruct(rab_broker *b, const char **err) {
                     break;
                 }
                 /* rate windows rebuild from client ops (audit records), not from
-                 * broker-generated checkpoints. */
+                 * broker-generated checkpoints. The op's appended size is the
+                 * stored line plus its newline. */
                 if (s.type == RAB_REC_AUDIT) {
-                    rate_note(b, s.actor.uid, s.time_us);
+                    rate_note(b, s.actor.uid, s.time_us,
+                              (unsigned long long) linelen + 1);
                 }
                 rab_stored_free(&s);
             }
@@ -973,7 +1158,7 @@ static int reconstruct(rab_broker *b, const char **err) {
         p = nl + 1;
     }
     free(buf);
-    cid_free(closed);
+    cidset_free(&closed);
     if (rc != 0) {
         return rc;
     }
@@ -1015,12 +1200,34 @@ rab_broker *rab_broker_open(const char *path, const rab_config *cfg,
         free(b);
         return NULL;
     }
+    /* A per-uid byte quota is enforced through the op ring, whose size is bounded
+     * by the op-count limit; without that limit the ring is unbounded, so refuse
+     * the combination rather than run an unbounded structure. */
+    if (b->cfg.rate_max_bytes_per_uid != 0 && b->cfg.rate_max_in_window == 0) {
+        *err = "rate_max_bytes_per_uid requires rate_max_in_window > 0";
+        free(b->path);
+        free(b);
+        return NULL;
+    }
     b->clock = clock ? clock : real_clock;
     b->clock_ctx = ctx;
     if (gethostname(b->host, sizeof b->host) != 0) {
         b->host[0] = '\0';
     }
     b->host[sizeof b->host - 1] = '\0';
+
+    /* the open-intent tables (by cid, by binding) and the per-uid table, sized
+     * once up front because reconstruction populates them. */
+    b->nbkt = pow2_ceil(b->cfg.max_open_global ? b->cfg.max_open_global : 16);
+    b->nbkt_uid = 1024;
+    b->bkt_cid = calloc(b->nbkt, sizeof *b->bkt_cid);
+    b->bkt_bind = calloc(b->nbkt, sizeof *b->bkt_bind);
+    b->bkt_uid = calloc(b->nbkt_uid, sizeof *b->bkt_uid);
+    if (b->bkt_cid == NULL || b->bkt_bind == NULL || b->bkt_uid == NULL) {
+        *err = "out of memory allocating broker tables";
+        rab_broker_close(b);
+        return NULL;
+    }
 
     /* discard a stray pending segment from a crashed rotation: the current
      * path is always the authoritative superset. */
@@ -1051,19 +1258,33 @@ void rab_broker_close(rab_broker *b) {
     if (b == NULL) {
         return;
     }
-    intent *it = b->open;
-    while (it != NULL) {
-        intent *n = it->next;
-        free(it);
-        it = n;
+    /* free every open intent by walking the by-cid table (its authoritative
+     * membership; the by-bind table indexes the same nodes). */
+    if (b->bkt_cid != NULL) {
+        for (size_t i = 0; i < b->nbkt; i++) {
+            intent *it = b->bkt_cid[i];
+            while (it != NULL) {
+                intent *n = it->hcid;
+                free(it);
+                it = n;
+            }
+        }
     }
-    uid_state *u = b->uids;
-    while (u != NULL) {
-        uid_state *n = u->next;
-        free(u->ring);
-        free(u);
-        u = n;
+    if (b->bkt_uid != NULL) {
+        for (size_t i = 0; i < b->nbkt_uid; i++) {
+            uid_state *u = b->bkt_uid[i];
+            while (u != NULL) {
+                uid_state *n = u->hnext;
+                free(u->ts);
+                free(u->bytes);
+                free(u);
+                u = n;
+            }
+        }
     }
+    free(b->bkt_cid);
+    free(b->bkt_bind);
+    free(b->bkt_uid);
     if (b->fd >= 0) {
         close(b->fd);
     }
@@ -1074,7 +1295,8 @@ void rab_broker_close(rab_broker *b) {
 size_t rab_broker_open_count(const rab_broker *b) { return b->open_count; }
 
 int rab_broker_has_open(const rab_broker *b, const char *correlation_id) {
-    for (intent *it = b->open; it != NULL; it = it->next) {
+    for (intent *it = b->bkt_cid[hstr(correlation_id) & (b->nbkt - 1)];
+         it != NULL; it = it->hcid) {
         if (strcmp(it->cid, correlation_id) == 0) {
             return 1;
         }
