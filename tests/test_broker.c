@@ -51,6 +51,12 @@ static void sink_path(const char *dir, char *out, size_t n) {
     snprintf(out, n, "%s/audit.jsonl", dir);
 }
 
+/* current on-disk size of a file, or -1 if it does not exist. */
+static long file_size(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0) ? (long) st.st_size : -1;
+}
+
 static void cleanup_dir(const char *dir) {
     DIR *d = opendir(dir);
     if (d != NULL) {
@@ -1023,6 +1029,96 @@ static void test_emit(void) {
     cleanup_dir(dir2);
 }
 
+/* Capability negotiation is pure discovery: it returns the broker's supported
+ * versions/extensions, opens no intent, appends nothing to the durable sink, and
+ * is not charged against the per-uid audit rate budget. Until the effect-receipt
+ * capability is honoured, `extensions` is empty and `plan_schemas` is []. */
+static void test_capabilities(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (capabilities)");
+
+    long before = file_size(path);
+    const char *body = "{\"type\":\"capabilities\"}";
+    rab_request req;
+    const char *e = NULL;
+    CHECK(rab_parse_request(body, strlen(body), &req, &e) == 0, "parse caps");
+    char *resp = NULL;
+    int rc = rab_broker_handle(b, &a, &req, &resp);
+    rab_request_free(&req);
+    CHECK(rc == 0 && resp != NULL, "capabilities handled");
+    /* dispatch routes to the capabilities builder; the byte-exact golden is
+     * pinned against the shared corpus in test_fixtures.c, not duplicated here. */
+    char *want = rab_response_capabilities();
+    CHECK(resp != NULL && want != NULL && strcmp(resp, want) == 0,
+          "capabilities response via broker matches the builder");
+    free(want);
+    free(resp);
+
+    /* read-only: opens no intent and grows the sink by zero bytes */
+    CHECK(rab_broker_open_count(b) == 0, "capabilities opens no intent");
+    CHECK(file_size(path) == before, "capabilities appends nothing");
+    rab_broker_close(b);
+
+    /* nothing persisted: a restart reconstructs an empty broker */
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL && rab_broker_open_count(b) == 0,
+          "capabilities left no durable trace");
+    rab_broker_close(b);
+    cleanup_dir(dir);
+
+    /* discovery is not charged against the per-uid audit rate budget: a client
+     * that polls capabilities before every mutation must not throttle itself. */
+    char dir2[256], path2[512];
+    tmpdir(dir2, sizeof dir2);
+    sink_path(dir2, path2, sizeof path2);
+    rab_config cfg2;
+    rab_config_defaults(&cfg2);
+    cfg2.rate_max_in_window = 1;
+    cfg2.rate_window_sec = 100;
+    unsigned long long save_now = g_now, save_step = g_step;
+    g_step = 0;
+    g_now = 3100000000000000ull;
+    rab_broker *b2 = rab_broker_open(path2, &cfg2, test_clock, NULL, &err);
+    CHECK(b2 != NULL, "broker open (caps rate)");
+    int all_ok = 1;
+    for (int i = 0; i < 5; i++) {
+        rab_request rq;
+        const char *ee = NULL;
+        if (rab_parse_request(body, strlen(body), &rq, &ee) != 0) {
+            all_ok = 0;
+            break;
+        }
+        char *rp = NULL;
+        int r2 = rab_broker_handle(b2, &a, &rq, &rp);
+        rab_request_free(&rq);
+        if (r2 != 0 || rp == NULL || strstr(rp, "\"ok\":true") == NULL) {
+            all_ok = 0;
+            free(rp);
+            break;
+        }
+        free(rp);
+    }
+    CHECK(all_ok, "capabilities is never audit-rate-limited");
+    /* prove the budget was genuinely untouched by discovery: with a one-op
+     * window, one real audited op still succeeds after the five capability
+     * calls, and it was exactly one (the next audited op is then rate-limited). */
+    CHECK(strcmp(do_open(b2, &a, NULL, NULL), "OK") == 0,
+          "capability polling left the audited-op budget intact");
+    CHECK(strcmp(do_open(b2, &a, NULL, NULL), "rate_limited") == 0,
+          "the single audited-op budget is then spent");
+    rab_broker_close(b2);
+    g_now = save_now;
+    g_step = save_step;
+    cleanup_dir(dir2);
+}
+
 static void test_bounded_open_intents(void) {
     char dir[256], path[512];
     tmpdir(dir, sizeof dir);
@@ -1602,6 +1698,7 @@ int main(void) {
     test_partial_tail_recovery();
     test_free_space_refusal();
     test_emit();
+    test_capabilities();
     test_carry_forward_idempotency();
     test_rotation_preserves_open_intents();
     test_bounded_open_intents();

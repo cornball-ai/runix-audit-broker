@@ -882,6 +882,13 @@ static int handle_emit(rab_broker *b, const rab_actor *actor,
     return reply(resp, rab_response_emit_ok(cid, "system"));
 }
 
+/* Capability discovery: a pure function of compile-time support, touching no
+ * broker state and appending nothing. It answers "does this broker offer
+ * receipts, and under which digest schemas" before a client opens an intent. */
+static int handle_capabilities(char **resp) {
+    return reply(resp, rab_response_capabilities());
+}
+
 int rab_broker_handle(rab_broker *b, const rab_actor *actor,
                       const rab_request *req, char **resp) {
     *resp = NULL;
@@ -899,6 +906,8 @@ int rab_broker_handle(rab_broker *b, const rab_actor *actor,
         return handle_outcome(b, actor, req, resp);
     case RAB_REQ_EMIT:
         return handle_emit(b, actor, req, resp);
+    case RAB_REQ_CAPABILITIES:
+        return handle_capabilities(resp);
     }
     return reply(resp, rab_response_error("internal", "unhandled request type"));
 }

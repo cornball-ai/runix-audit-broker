@@ -22,6 +22,12 @@
 #define RAB_PHASE_INTENT "intent"
 #define RAB_PHASE_OUTCOME "outcome"
 
+/* Public audit-record schema version: the top-level `schema_version` stamped on
+ * every record and enforced on reconstruction. This is the single axis the
+ * `capabilities` response advertises as `record_schema_version`, so the wire
+ * value cannot drift from what the broker actually stamps and validates. */
+#define RAB_RECORD_SCHEMA_VERSION 1u
+
 /* max stored open-intent metadata strings (operation/resource/scope) */
 #define RAB_META_MAX 128
 #define RAB_SCOPE_MAX 32

@@ -124,6 +124,8 @@ int main(void) {
                  rab_response_emit_ok("00001786382512165708-a061ec02cffe1b2b",
                                       "system"),
                  "emit_ok builder matches the shared fixture");
+    check_golden("capabilities_ok.json", rab_response_capabilities(),
+                 "capabilities builder matches the shared fixture");
     check_golden("error.json", rab_response_error("schema_invalid", "nope"),
                  "error builder matches the shared fixture");
 
