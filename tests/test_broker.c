@@ -1053,10 +1053,12 @@ static void test_capabilities(void) {
     int rc = rab_broker_handle(b, &a, &req, &resp);
     rab_request_free(&req);
     CHECK(rc == 0 && resp != NULL, "capabilities handled");
-    CHECK(resp != NULL && strcmp(resp,
-        "{\"extensions\":{},\"frame_version\":1,\"ok\":true,"
-        "\"plan_schemas\":[],\"record_schema_version\":1}") == 0,
-        "capabilities golden bytes via broker");
+    /* dispatch routes to the capabilities builder; the byte-exact golden is
+     * pinned against the shared corpus in test_fixtures.c, not duplicated here. */
+    char *want = rab_response_capabilities();
+    CHECK(resp != NULL && want != NULL && strcmp(resp, want) == 0,
+          "capabilities response via broker matches the builder");
+    free(want);
     free(resp);
 
     /* read-only: opens no intent and grows the sink by zero bytes */
