@@ -117,6 +117,73 @@ int main(void) {
     CHECK(strcmp(PARSE("{\"type\":\"capabilities\",\"binding\":\"x\"}"),
                  "schema_invalid") == 0, "caps with a binding rejected");
 
+    /* --- open_intent effect: opt-in receipt request, exact grammar --- */
+#define HEX64 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":"
+                       "{\"operation\":\"apt.install\",\"outcome\":\"intent\"},"
+                       "\"effect\":{\"required\":true,\"plan_schema\":1,"
+                       "\"plan_hash\":\"" HEX64 "\"}}"), "OK") == 0,
+          "valid open_intent with effect");
+    {
+        rab_request req;
+        const char *err = NULL;
+        const char *b = "{\"type\":\"open_intent\",\"record\":"
+                        "{\"operation\":\"apt.install\",\"outcome\":\"intent\"},"
+                        "\"effect\":{\"required\":true,\"plan_schema\":2,"
+                        "\"plan_hash\":\"" HEX64 "\"}}";
+        CHECK(rab_parse_request(b, strlen(b), &req, &err) == 0, "parse effect");
+        CHECK(req.effect_present == 1, "effect present flagged");
+        CHECK(req.effect_required == 1, "effect required extracted");
+        CHECK(req.effect_plan_schema == 2, "plan_schema extracted");
+        CHECK(strcmp(req.effect_plan_hash, HEX64) == 0, "plan_hash extracted");
+        rab_request_free(&req);
+    }
+    /* an absent effect is today's behaviour: parses, nothing flagged */
+    {
+        rab_request req;
+        const char *err = NULL;
+        const char *b = "{\"type\":\"open_intent\",\"record\":"
+                        "{\"operation\":\"x\",\"outcome\":\"intent\"}}";
+        CHECK(rab_parse_request(b, strlen(b), &req, &err) == 0, "parse no-effect");
+        CHECK(req.effect_present == 0, "no effect flagged when absent");
+        rab_request_free(&req);
+    }
+    /* malformed effect objects are rejected (exact grammar) */
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_schema\":1,\"plan_hash\":\"tooshort\"}}"),
+                 "schema_invalid") == 0, "effect short plan_hash rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "ab\"}}"),
+                 "schema_invalid") == 0, "effect long plan_hash rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_schema\":1,\"plan_hash\":"
+                       "\"0123456789ABCDEF0123456789abcdef0123456789abcdef"
+                       "0123456789abcdef\"}}"),
+                 "schema_invalid") == 0, "effect uppercase plan_hash rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_schema\":0,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "effect plan_schema 0 rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":\"yes\","
+                       "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "effect non-bool required rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "effect missing plan_schema rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "\",\"x\":1}}"),
+                 "schema_invalid") == 0, "effect extra key rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":5}"),
+                 "schema_invalid") == 0, "effect not an object rejected");
+#undef HEX64
+
     /* --- duplicate keys rejected (JSON_REJECT_DUPLICATES) --- */
     CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"type\":\"open_intent\","
                        "\"record\":{\"operation\":\"x\",\"outcome\":\"i\"}}"),

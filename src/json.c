@@ -144,6 +144,38 @@ static int only_keys(json_t *obj, const char *const *allowed, size_t n) {
     return 1;
 }
 
+/* A 64-char lowercase-hex string (a SHA-256 digest), NUL-terminated at 64. */
+static int is_hex64(const char *s) {
+    for (size_t i = 0; i < 64; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return 0;
+        }
+    }
+    return s[64] == '\0';
+}
+
+/* An open_intent `effect` object is exactly {required: bool, plan_schema:
+ * int >= 1, plan_hash: 64 lowercase hex}. Grammar only; the broker decides
+ * whether it can honour the request. */
+static int effect_valid(json_t *e) {
+    if (!json_is_object(e)) {
+        return 0;
+    }
+    static const char *const ek[] = {"required", "plan_schema", "plan_hash"};
+    if (!only_keys(e, ek, 3)) {
+        return 0;
+    }
+    json_t *req = json_object_get(e, "required");
+    json_t *ps = json_object_get(e, "plan_schema");
+    json_t *ph = json_object_get(e, "plan_hash");
+    if (!json_is_boolean(req) || !json_is_integer(ps) ||
+        json_integer_value(ps) < 1 || !json_is_string(ph)) {
+        return 0;
+    }
+    return is_hex64(json_string_value(ph));
+}
+
 int rab_parse_request(const char *body, size_t len, rab_request *req,
                       const char **errcode) {
     *errcode = "bad_json";
@@ -151,6 +183,10 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
     req->record = NULL;
     req->binding[0] = '\0';
     req->phase[0] = '\0';
+    req->effect_present = 0;
+    req->effect_required = 0;
+    req->effect_plan_schema = 0;
+    req->effect_plan_hash[0] = '\0';
 
     json_error_t jerr;
     /* JSON_REJECT_DUPLICATES: reject duplicate keys. No JSON_DISABLE_EOF_CHECK
@@ -177,12 +213,29 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
     json_t *record = json_object_get(root, "record");
 
     if (strcmp(type, "open_intent") == 0) {
-        static const char *const allowed[] = {"type", "record"};
-        if (!only_keys(root, allowed, 2) || !json_is_object(record) ||
+        static const char *const allowed[] = {"type", "record", "effect"};
+        json_t *effect = json_object_get(root, "effect");
+        if (!only_keys(root, allowed, 3) || !json_is_object(record) ||
             !record_valid(record)) {
             json_decref(root);
             *errcode = "schema_invalid";
             return -1;
+        }
+        if (effect != NULL) {
+            /* an effect request is opt-in; when present its grammar is exact. */
+            if (!effect_valid(effect)) {
+                json_decref(root);
+                *errcode = "schema_invalid";
+                return -1;
+            }
+            req->effect_present = 1;
+            req->effect_required =
+                json_is_true(json_object_get(effect, "required")) ? 1 : 0;
+            req->effect_plan_schema =
+                json_integer_value(json_object_get(effect, "plan_schema"));
+            memcpy(req->effect_plan_hash,
+                   json_string_value(json_object_get(effect, "plan_hash")), 64);
+            req->effect_plan_hash[64] = '\0';
         }
         req->type = RAB_REQ_OPEN_INTENT;
     } else if (strcmp(type, "write_outcome") == 0) {

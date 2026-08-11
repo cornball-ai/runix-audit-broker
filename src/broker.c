@@ -714,6 +714,17 @@ static void rec_str(json_t *record, const char *key, char *dst, size_t cap) {
 
 static int handle_open(rab_broker *b, const rab_actor *actor,
                        const rab_request *req, char **resp) {
+    /* Effect-receipt issuance is not yet backed by durable receipt state, so an
+     * open_intent requesting an effect FAILS CLOSED here. It must never be
+     * downgraded to an ordinary intent, which would silently drop the effect
+     * binding. This guard is replaced by real issuance once receipt state,
+     * persistence, and reconstruction all exist; until then the capability
+     * stays unadvertised, so no conforming client reaches this path. */
+    if (req->effect_present) {
+        return reply(resp, rab_response_error(
+                               "effect_unsupported",
+                               "effect receipts are not available on this broker"));
+    }
     unsigned long long now = b->clock(b->clock_ctx);
     if (!rate_allowed(b, actor->uid, now)) {
         return reply(resp,

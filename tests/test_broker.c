@@ -1119,6 +1119,51 @@ static void test_capabilities(void) {
     cleanup_dir(dir2);
 }
 
+/* An open_intent that requests an effect must FAIL CLOSED while issuance is
+ * unbacked: a typed refusal, and crucially never a downgrade to an ordinary
+ * intent (which would silently drop the effect binding). Nothing is opened,
+ * nothing is appended, and reconstruction sees no trace. */
+static void test_effect_fail_closed(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (effect fail-closed)");
+
+    long before = file_size(path);
+    const char *body =
+        "{\"type\":\"open_intent\",\"record\":"
+        "{\"operation\":\"apt.install\",\"outcome\":\"intent\"},"
+        "\"effect\":{\"required\":true,\"plan_schema\":1,\"plan_hash\":"
+        "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}}";
+    rab_request req;
+    const char *e = NULL;
+    CHECK(rab_parse_request(body, strlen(body), &req, &e) == 0, "parse effect req");
+    char *resp = NULL;
+    int rc = rab_broker_handle(b, &a, &req, &resp);
+    rab_request_free(&req);
+    CHECK(rc == 0 && resp != NULL, "effect open handled");
+    CHECK(resp != NULL && strstr(resp, "\"error\":\"effect_unsupported\"") != NULL,
+          "effect request refused effect_unsupported");
+    free(resp);
+
+    /* no downgrade: nothing opened, sink grew by zero bytes */
+    CHECK(rab_broker_open_count(b) == 0, "effect request opened no intent");
+    CHECK(file_size(path) == before, "effect request appended nothing");
+    rab_broker_close(b);
+
+    /* durable proof: reconstruction sees an empty broker */
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL && rab_broker_open_count(b) == 0,
+          "refused effect left no durable trace");
+    rab_broker_close(b);
+    cleanup_dir(dir);
+}
+
 static void test_bounded_open_intents(void) {
     char dir[256], path[512];
     tmpdir(dir, sizeof dir);
@@ -1699,6 +1744,7 @@ int main(void) {
     test_free_space_refusal();
     test_emit();
     test_capabilities();
+    test_effect_fail_closed();
     test_carry_forward_idempotency();
     test_rotation_preserves_open_intents();
     test_bounded_open_intents();

@@ -14,6 +14,7 @@
 
 #define RAB_MAX_DEPTH 8       /* records are shallow: object > record > observed */
 #define RAB_BINDING_STR_MAX 128
+#define RAB_PLAN_HASH_MAX 65  /* 64-hex SHA-256 plan digest + NUL */
 
 typedef enum {
     RAB_REQ_OPEN_INTENT,
@@ -26,6 +27,13 @@ typedef struct {
     rab_req_type type;
     char binding[RAB_BINDING_STR_MAX]; /* write_outcome only; "" otherwise */
     char phase[16];                    /* emit only: "preview"|"noop"; "" else */
+    /* open_intent effect request (opt-in). effect_present == 0 is today's
+     * behaviour; when set, the fields are grammar-validated here and the broker
+     * decides whether it can honour issuance (fail-closed until it can). */
+    int effect_present;
+    int effect_required;                      /* effect.required */
+    json_int_t effect_plan_schema;            /* effect.plan_schema (>= 1) */
+    char effect_plan_hash[RAB_PLAN_HASH_MAX]; /* effect.plan_hash (64 lc hex) */
     json_t *record;                    /* borrowed from root */
     json_t *root;                      /* owned; free via rab_request_free */
 } rab_request;

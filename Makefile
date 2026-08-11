@@ -20,26 +20,38 @@ LDFLAGS += $(DPKG_LDFLAGS)
 JSON_CFLAGS := $(shell pkg-config --cflags jansson 2>/dev/null)
 JSON_LIBS   := $(shell pkg-config --libs jansson 2>/dev/null)
 
+# libcrypto (OpenSSL) supplies the receipt verifier's SHA-256 + CRYPTO_memcmp.
+CRYPTO_CFLAGS := $(shell pkg-config --cflags libcrypto 2>/dev/null)
+CRYPTO_LIBS   := $(shell pkg-config --libs libcrypto 2>/dev/null)
+
 BIN := audit-broker
 CORE := src/proto.c src/sink.c src/peer.c src/id.c
-BROKER_SRC := $(CORE) src/json.c src/record.c src/broker.c src/main.c
+BROKER_SRC := $(CORE) src/json.c src/record.c src/receipt.c src/broker.c src/main.c
 
 PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec
 UNITDIR ?= /lib/systemd/system
 
-.PHONY: all test test-json test-broker test-socket test-fixtures check fuzz probe asan clean install
+.PHONY: all test test-receipt test-json test-broker test-socket test-fixtures check fuzz probe asan clean install
 all: $(BIN)
 
 # One-shot client used by the activation gate: connect + send one open_intent.
 probe: tools/rab-probe.c src/proto.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o rab-probe $(LDFLAGS)
 
-check: test test-json test-broker test-socket test-fixtures
+check: test test-receipt test-json test-broker test-socket test-fixtures
 
-# The full broker binary (needs libjansson-dev + the JSON/main sources).
+# The full broker binary (needs libjansson-dev + libssl-dev + the JSON/main src).
 $(BIN): $(BROKER_SRC)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(JSON_CFLAGS) $^ -o $@ $(LDFLAGS) $(JSON_LIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(JSON_CFLAGS) $(CRYPTO_CFLAGS) $^ -o $@ \
+	    $(LDFLAGS) $(JSON_LIBS) $(CRYPTO_LIBS)
+
+# Receipt-token crypto unit tests (SHA-256 known-answer vectors, constant-time
+# compare) against libcrypto, built with ASan/UBSan.
+test-receipt: src/receipt.c tests/test_receipt.c
+	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(CRYPTO_CFLAGS) \
+	    -fsanitize=address,undefined -g $^ -o build-test-receipt $(CRYPTO_LIBS)
+	./build-test-receipt
 
 # Core unit tests, JSON-library-independent, built with ASan/UBSan.
 test: $(CORE) tests/test_core.c
@@ -63,8 +75,9 @@ test-broker: src/broker.c src/record.c src/json.c $(CORE) tests/test_broker.c
 # An ASan/UBSan build of the whole broker binary, so the daemon runs under the
 # sanitizer during the live socket tests.
 build-broker-asan: $(BROKER_SRC)
-	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) \
-	    -fsanitize=address,undefined -g $^ -o build-broker-asan $(JSON_LIBS)
+	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) $(CRYPTO_CFLAGS) \
+	    -fsanitize=address,undefined -g $^ -o build-broker-asan \
+	    $(JSON_LIBS) $(CRYPTO_LIBS)
 
 # Socket-level tests: exec the ASan broker and drive it over AF_UNIX (slowloris,
 # concurrency, disconnect durability, connection limits). Built with ASan/UBSan.
@@ -91,9 +104,9 @@ fuzz: fuzz/fuzz_frame.c src/json.c
 	    -fsanitize=fuzzer,address,undefined -g $^ -o fuzz-proto $(JSON_LIBS)
 
 clean:
-	rm -f $(BIN) build-test-core build-test-json build-test-broker \
-	    build-test-socket build-test-fixtures build-broker-asan fuzz-proto \
-	    rab-probe src/*.o
+	rm -f $(BIN) build-test-core build-test-receipt build-test-json \
+	    build-test-broker build-test-socket build-test-fixtures \
+	    build-broker-asan fuzz-proto rab-probe src/*.o
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) \
