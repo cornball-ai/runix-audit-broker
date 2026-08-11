@@ -28,7 +28,9 @@ One request frame yields exactly one response frame (same framing).
 
 ## Requests (client -> broker)
 
-Exactly three `type`s. Any other is `unknown_request`.
+Exactly four `type`s. Any other is `unknown_request`. (The effect-receipt
+capability, once it lands, adds a fifth, `redeem_receipt`; it is discoverable
+via `capabilities` and absent until then.)
 
 ```jsonc
 // open an intent (before the effect is issued)
@@ -44,6 +46,10 @@ Exactly three `type`s. Any other is `unknown_request`.
 { "type": "emit",
   "phase": "preview" | "noop",           // no other phase is accepted
   "record": { /* non-effect domain content; effect_issued must not be true */ } }
+
+// capability discovery (read-only): learn what this broker supports before
+// opening an intent. No record, no binding, no phase; opens no intent.
+{ "type": "capabilities" }
 ```
 
 `emit` is deliberately narrow: it mints a `correlation_id`, returns **no
@@ -63,10 +69,11 @@ like the effect paths.
 - The `record` is validated against the durable-audit schema: required fields
   present, correct types, integers in range, **no** unexpected fields,
   bounded nesting depth.
-- Any `actor`/identity field in `record` is **ignored**: the broker stamps the
-  full peer identity from `SO_PEERCRED` (uid/gid/pid) plus the boot id and the
-  peer's process start time (for PID-reuse safety) over anything the payload
-  claims.
+- The client cannot supply identity at all: `record` is a fixed allowlist of
+  domain fields, so any `actor`/identity or broker-owned key in it is
+  **rejected** (`schema_invalid`), not silently ignored. The broker stamps the
+  full peer identity itself from `SO_PEERCRED` (uid/gid/pid) plus the boot id and
+  the peer's process start time (for PID-reuse safety).
 - The broker mints `correlation_id`, `schema_version`, `host`, `pid`, `time`,
   and the `phase` (`intent`/`outcome`); a client cannot set them.
 
@@ -84,9 +91,20 @@ like the effect paths.
 { "ok": true, "correlation_id": "<minted>", "persisted": true,
   "audit_scope": "system" }
 
+// capabilities (read-only discovery; writes nothing, opens no intent)
+{ "ok": true, "frame_version": 1, "record_schema_version": 1,
+  "extensions": { /* "effect_receipt": N when supported; absent => unsupported */ },
+  "plan_schemas": [ /* accepted plan-digest encodings; [] when none */ ] }
+
 // any error (typed, closed set)
 { "ok": false, "error": "<code>", "message": "<human detail>" }
 ```
+
+`frame_version` and `record_schema_version` are emitted from the same
+`RAB_PROTO_VERSION` / `RAB_RECORD_SCHEMA_VERSION` constants the broker stamps and
+validates records with, so the advertised versions cannot drift from the
+implementation. `extensions` is empty and `plan_schemas` is `[]` until the
+broker actually honours the corresponding capability.
 
 Error codes (closed set; deterministic per input):
 
@@ -95,7 +113,7 @@ Error codes (closed set; deterministic per input):
 | `bad_frame` | version wrong, or a truncated/interrupted frame |
 | `too_large` | body length exceeds the maximum |
 | `bad_json` | body is not valid UTF-8 JSON, or has trailing content |
-| `unknown_request` | `type` is not `open_intent`/`write_outcome`/`emit` |
+| `unknown_request` | `type` is not `open_intent`/`write_outcome`/`emit`/`capabilities` |
 | `schema_invalid` | record fails schema/type/range/extra-field checks |
 | `unknown_intent` | `binding` matches no open intent |
 | `actor_mismatch` | `binding` belongs to a different `SO_PEERCRED` actor |

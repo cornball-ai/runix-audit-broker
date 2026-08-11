@@ -1,5 +1,8 @@
 #include "json.h"
 
+#include "proto.h"   /* RAB_PROTO_VERSION: the frame-protocol version */
+#include "record.h"  /* RAB_RECORD_SCHEMA_VERSION: the public record schema */
+
 #include <string.h>
 
 /* Allowed record fields and their permitted JSON types. The client sends only
@@ -312,8 +315,9 @@ char *rab_response_capabilities(void) {
         return NULL;
     }
     json_object_set_new(o, "ok", json_true());
-    json_object_set_new(o, "frame_version", json_integer(1));
-    json_object_set_new(o, "record_schema_version", json_integer(1));
+    json_object_set_new(o, "frame_version", json_integer(RAB_PROTO_VERSION));
+    json_object_set_new(o, "record_schema_version",
+                        json_integer(RAB_RECORD_SCHEMA_VERSION));
     /* effect_receipt is advertised (and plan_schemas populated) only once the
      * broker actually honours redemption; until then the map is empty so a
      * client never assumes a capability the broker cannot back. */

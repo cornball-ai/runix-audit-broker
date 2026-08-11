@@ -89,7 +89,8 @@ char *rab_build_audit(const char *phase, const char *correlation_id,
     }
     int bad = 0;
     /* canonical framing, insertion order */
-    bad |= json_object_set_new(root, "schema_version", json_integer(1));
+    bad |= json_object_set_new(root, "schema_version",
+                               json_integer(RAB_RECORD_SCHEMA_VERSION));
     bad |= json_object_set_new(root, "record_type", json_string("audit"));
     bad |= json_object_set_new(root, "correlation_id",
                                json_string(correlation_id));
@@ -135,7 +136,8 @@ char *rab_build_checkpoint(const char *correlation_id, const char *binding,
                                 operation ? operation : "",
                                 resource ? resource : "", scope ? scope : "");
     int bad = 0;
-    bad |= json_object_set_new(root, "schema_version", json_integer(1));
+    bad |= json_object_set_new(root, "schema_version",
+                               json_integer(RAB_RECORD_SCHEMA_VERSION));
     bad |= json_object_set_new(root, "record_type",
                                json_string("broker_checkpoint"));
     bad |= json_object_set_new(root, "correlation_id",
@@ -175,7 +177,8 @@ char *rab_build_rate(uid_t uid, const unsigned long long *times,
         bad |= json_array_append_new(barr, json_string(buf));
     }
     /* insertion order: schema_version, record_type, uid, times_us, bytes */
-    bad |= json_object_set_new(root, "schema_version", json_integer(1));
+    bad |= json_object_set_new(root, "schema_version",
+                               json_integer(RAB_RECORD_SCHEMA_VERSION));
     bad |= json_object_set_new(root, "record_type", json_string("broker_rate"));
     bad |= json_object_set_new(root, "uid", json_integer((json_int_t) uid));
     if (!bad) {
@@ -318,7 +321,8 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
     }
     /* top-level schema_version must be exactly 1 (unknown version fails) */
     json_t *sv = json_object_get(root, "schema_version");
-    if (!json_is_integer(sv) || json_integer_value(sv) != 1) {
+    if (!json_is_integer(sv) ||
+        json_integer_value(sv) != RAB_RECORD_SCHEMA_VERSION) {
         goto done;
     }
     /* record_type must be a known value: no silent "audit" fall-through */

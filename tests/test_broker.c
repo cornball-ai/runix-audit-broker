@@ -1104,6 +1104,13 @@ static void test_capabilities(void) {
         free(rp);
     }
     CHECK(all_ok, "capabilities is never audit-rate-limited");
+    /* prove the budget was genuinely untouched by discovery: with a one-op
+     * window, one real audited op still succeeds after the five capability
+     * calls, and it was exactly one (the next audited op is then rate-limited). */
+    CHECK(strcmp(do_open(b2, &a, NULL, NULL), "OK") == 0,
+          "capability polling left the audited-op budget intact");
+    CHECK(strcmp(do_open(b2, &a, NULL, NULL), "rate_limited") == 0,
+          "the single audited-op budget is then spent");
     rab_broker_close(b2);
     g_now = save_now;
     g_step = save_step;
