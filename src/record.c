@@ -197,6 +197,52 @@ char *rab_build_rate(uid_t uid, const unsigned long long *times,
     return s;
 }
 
+char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
+                        const char *verifier_hex, uid_t actor_uid,
+                        const char *verb, const char *resource,
+                        long long plan_schema, const char *plan_hash,
+                        unsigned long long issue_boottime_us,
+                        unsigned long long ttl_us, const char *boot_id) {
+    json_t *root = json_object();
+    if (root == NULL) {
+        return NULL;
+    }
+    char ibt[24];
+    char ttl[24];
+    snprintf(ibt, sizeof ibt, "%llu", issue_boottime_us);
+    snprintf(ttl, sizeof ttl, "%llu", ttl_us);
+    int bad = 0;
+    bad |= json_object_set_new(root, "schema_version",
+                               json_integer(RAB_RECORD_SCHEMA_VERSION));
+    bad |= json_object_set_new(root, "record_type",
+                               json_string("broker_receipt"));
+    bad |= json_object_set_new(root, "state_schema_version",
+                               json_integer(RAB_BROKER_STATE_SCHEMA_VERSION));
+    bad |= json_object_set_new(root, "correlation_id",
+                               json_string(correlation_id));
+    bad |= json_object_set_new(
+        root, "state",
+        json_string(state == RAB_RCPT_REDEEMED ? "redeemed" : "issued"));
+    bad |= json_object_set_new(root, "verifier", json_string(verifier_hex));
+    bad |= json_object_set_new(root, "actor_uid",
+                               json_integer((json_int_t) actor_uid));
+    bad |= json_object_set_new(root, "verb", json_string(verb));
+    bad |= json_object_set_new(root, "resource", json_string(resource));
+    bad |= json_object_set_new(root, "plan_schema",
+                               json_integer((json_int_t) plan_schema));
+    bad |= json_object_set_new(root, "plan_hash", json_string(plan_hash));
+    bad |= json_object_set_new(root, "issue_boottime_us", json_string(ibt));
+    bad |= json_object_set_new(root, "ttl_us", json_string(ttl));
+    bad |= json_object_set_new(root, "boot_id", json_string(boot_id));
+    if (bad) {
+        json_decref(root);
+        return NULL;
+    }
+    char *s = json_dumps(root, JSON_COMPACT);
+    json_decref(root);
+    return s;
+}
+
 void rab_stored_free(rab_stored *out) {
     if (out == NULL) {
         return;
@@ -243,6 +289,17 @@ static int parse_u64_strict(const char *s, unsigned long long *out) {
     }
     *out = v;
     return 0;
+}
+
+/* A 64-char lowercase-hex string (SHA-256 verifier or plan digest). */
+static int is_hex64_lc(const char *s) {
+    for (size_t i = 0; i < 64; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return 0;
+        }
+    }
+    return s[64] == '\0';
 }
 
 /* Validate and load the broker.peer object exactly. */
@@ -386,6 +443,97 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
         out->rate_times = times;
         out->rate_bytes = bytes;
         out->rate_n = n;
+        rc = 0;
+        goto done;
+    } else if (strcmp(rts, "broker_receipt") == 0) {
+        /* durable effect-receipt state: a self-contained flat record with its
+         * own state schema version, no broker.peer extension, and no phase. It
+         * carries only the SHA-256 verifier, never the token. Validated exactly
+         * and in full here; any missing/extra/malformed field fails closed. */
+        static const char *const rk[] = {
+            "schema_version",   "record_type", "state_schema_version",
+            "correlation_id",   "state",       "verifier",
+            "actor_uid",        "verb",        "resource",
+            "plan_schema",      "plan_hash",   "issue_boottime_us",
+            "ttl_us",           "boot_id"};
+        if (!obj_only_keys(root, rk, 14)) {
+            goto done;
+        }
+        json_t *ssv = json_object_get(root, "state_schema_version");
+        if (!json_is_integer(ssv) ||
+            json_integer_value(ssv) != RAB_BROKER_STATE_SCHEMA_VERSION) {
+            goto done;
+        }
+        json_t *jcid = json_object_get(root, "correlation_id");
+        if (!json_is_string(jcid) || json_string_value(jcid)[0] == '\0' ||
+            copy_bounded(out->correlation_id, sizeof out->correlation_id,
+                         json_string_value(jcid)) != 0) {
+            goto done;
+        }
+        json_t *jstate = json_object_get(root, "state");
+        if (!json_is_string(jstate)) {
+            goto done;
+        }
+        const char *st = json_string_value(jstate);
+        if (strcmp(st, "issued") == 0) {
+            out->rcpt_state = RAB_RCPT_ISSUED;
+        } else if (strcmp(st, "redeemed") == 0) {
+            out->rcpt_state = RAB_RCPT_REDEEMED;
+        } else {
+            goto done;
+        }
+        json_t *jver = json_object_get(root, "verifier");
+        if (!json_is_string(jver) || !is_hex64_lc(json_string_value(jver)) ||
+            copy_bounded(out->rcpt_verifier, sizeof out->rcpt_verifier,
+                         json_string_value(jver)) != 0) {
+            goto done;
+        }
+        json_t *jauid = json_object_get(root, "actor_uid");
+        if (!json_is_integer(jauid) || json_integer_value(jauid) < 0) {
+            goto done;
+        }
+        out->rcpt_actor_uid = (long long) json_integer_value(jauid);
+        json_t *jverb = json_object_get(root, "verb");
+        if (!json_is_string(jverb) || json_string_value(jverb)[0] == '\0' ||
+            copy_bounded(out->rcpt_verb, sizeof out->rcpt_verb,
+                         json_string_value(jverb)) != 0) {
+            goto done;
+        }
+        json_t *jres = json_object_get(root, "resource");
+        if (!json_is_string(jres) || /* resource may be empty, but is a string */
+            copy_bounded(out->rcpt_resource, sizeof out->rcpt_resource,
+                         json_string_value(jres)) != 0) {
+            goto done;
+        }
+        json_t *jps = json_object_get(root, "plan_schema");
+        if (!json_is_integer(jps) || json_integer_value(jps) < 1) {
+            goto done;
+        }
+        out->rcpt_plan_schema = (long long) json_integer_value(jps);
+        json_t *jph = json_object_get(root, "plan_hash");
+        if (!json_is_string(jph) || !is_hex64_lc(json_string_value(jph)) ||
+            copy_bounded(out->rcpt_plan_hash, sizeof out->rcpt_plan_hash,
+                         json_string_value(jph)) != 0) {
+            goto done;
+        }
+        json_t *jibt = json_object_get(root, "issue_boottime_us");
+        if (!json_is_string(jibt) ||
+            parse_u64_strict(json_string_value(jibt),
+                             &out->rcpt_issue_boottime_us) != 0) {
+            goto done;
+        }
+        json_t *jttl = json_object_get(root, "ttl_us");
+        if (!json_is_string(jttl) ||
+            parse_u64_strict(json_string_value(jttl), &out->rcpt_ttl_us) != 0) {
+            goto done;
+        }
+        json_t *jboot = json_object_get(root, "boot_id");
+        if (!json_is_string(jboot) || json_string_value(jboot)[0] == '\0' ||
+            copy_bounded(out->rcpt_boot_id, sizeof out->rcpt_boot_id,
+                         json_string_value(jboot)) != 0) {
+            goto done;
+        }
+        out->type = RAB_REC_RECEIPT;
         rc = 0;
         goto done;
     } else {

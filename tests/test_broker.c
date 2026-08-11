@@ -430,6 +430,117 @@ static int parses_ok(const char *s) {
     return rc == 0;
 }
 
+/* a 64-char lowercase-hex digest (verifier / plan_hash) */
+#define RCPT_HX \
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+/* a broker_receipt literal with the mutable fields substituted (the rest fixed:
+ * correlation_id "c", verb "apt.install", resource "nginx", boot_id "b"). */
+#define RCPT(ssv, state, ver, uid, ps, ph, ibt, ttl)                          \
+    "{\"schema_version\":1,\"record_type\":\"broker_receipt\","               \
+    "\"state_schema_version\":" ssv ",\"correlation_id\":\"c\",\"state\":\""  \
+    state "\",\"verifier\":\"" ver "\",\"actor_uid\":" uid ",\"verb\":"       \
+    "\"apt.install\",\"resource\":\"nginx\",\"plan_schema\":" ps              \
+    ",\"plan_hash\":\"" ph "\",\"issue_boottime_us\":\"" ibt "\",\"ttl_us\":" \
+    "\"" ttl "\",\"boot_id\":\"b\"}"
+
+/* broker_receipt durable format: build -> parse round trip, the verifier-only
+ * invariant (Gate 1), and strict fail-closed on malformed/inconsistent records
+ * (Gate 4). */
+static void test_receipt_record(void) {
+    char *line = rab_build_receipt("cid-r1", RAB_RCPT_ISSUED, RCPT_HX, 1000,
+                                   "apt.install", "nginx", 1, RCPT_HX, 500000ull,
+                                   30000000ull, "boot-xyz");
+    CHECK(line != NULL, "receipt record built");
+    if (line != NULL) {
+        /* Gate 1: only the verifier is persisted, never a live token. */
+        CHECK(strstr(line, "\"verifier\":\"" RCPT_HX "\"") != NULL,
+              "receipt carries the verifier");
+        CHECK(strstr(line, "token") == NULL, "receipt carries no token field");
+        rab_stored s;
+        CHECK(rab_parse_stored(line, strlen(line), &s) == 0, "receipt parses");
+        CHECK(s.type == RAB_REC_RECEIPT, "parsed as receipt");
+        CHECK(strcmp(s.correlation_id, "cid-r1") == 0, "cid round-trips");
+        CHECK(s.rcpt_state == RAB_RCPT_ISSUED, "state issued round-trips");
+        CHECK(strcmp(s.rcpt_verifier, RCPT_HX) == 0, "verifier round-trips");
+        CHECK(s.rcpt_actor_uid == 1000, "actor_uid round-trips");
+        CHECK(strcmp(s.rcpt_verb, "apt.install") == 0, "verb round-trips");
+        CHECK(strcmp(s.rcpt_resource, "nginx") == 0, "resource round-trips");
+        CHECK(s.rcpt_plan_schema == 1, "plan_schema round-trips");
+        CHECK(strcmp(s.rcpt_plan_hash, RCPT_HX) == 0, "plan_hash round-trips");
+        CHECK(s.rcpt_issue_boottime_us == 500000ull, "issue boottime round-trips");
+        CHECK(s.rcpt_ttl_us == 30000000ull, "ttl round-trips");
+        CHECK(strcmp(s.rcpt_boot_id, "boot-xyz") == 0, "boot_id round-trips");
+        rab_stored_free(&s);
+        free(line);
+    }
+    /* a redeemed receipt with an empty resource round-trips its state too */
+    line = rab_build_receipt("cid-r2", RAB_RCPT_REDEEMED, RCPT_HX, 0,
+                             "apt.update", "", 2, RCPT_HX, 1ull, 2ull, "b");
+    CHECK(line != NULL, "redeemed receipt built");
+    if (line != NULL) {
+        rab_stored s;
+        CHECK(rab_parse_stored(line, strlen(line), &s) == 0, "redeemed parses");
+        CHECK(s.rcpt_state == RAB_RCPT_REDEEMED, "state redeemed round-trips");
+        CHECK(s.rcpt_resource[0] == '\0', "empty resource round-trips");
+        rab_stored_free(&s);
+        free(line);
+    }
+
+    /* baseline valid literal parses, so each single-field defect below is
+     * isolated to that defect. */
+    CHECK(parses_ok(RCPT("1", "issued", RCPT_HX, "1000", "1", RCPT_HX, "5",
+                         "30")),
+          "baseline valid receipt parses");
+    /* Gate 4: malformed / inconsistent records fail closed */
+    CHECK(!parses_ok(RCPT("2", "issued", RCPT_HX, "1000", "1", RCPT_HX, "5",
+                          "30")),
+          "wrong state_schema_version rejected");
+    CHECK(!parses_ok(RCPT("1", "expired", RCPT_HX, "1000", "1", RCPT_HX, "5",
+                          "30")),
+          "unknown receipt state rejected");
+    CHECK(!parses_ok(RCPT("1", "issued", "nothex", "1000", "1", RCPT_HX, "5",
+                          "30")),
+          "malformed verifier rejected");
+    CHECK(!parses_ok(RCPT("1", "issued", RCPT_HX, "-1", "1", RCPT_HX, "5",
+                          "30")),
+          "negative actor_uid rejected");
+    CHECK(!parses_ok(RCPT("1", "issued", RCPT_HX, "1000", "0", RCPT_HX, "5",
+                          "30")),
+          "plan_schema 0 rejected");
+    CHECK(!parses_ok(RCPT("1", "issued", RCPT_HX, "1000", "1", "nothex", "5",
+                          "30")),
+          "malformed plan_hash rejected");
+    CHECK(!parses_ok(RCPT("1", "issued", RCPT_HX, "1000", "1", RCPT_HX, "x",
+                          "30")),
+          "non-numeric issue_boottime_us rejected");
+    /* missing field, extra field, duplicate key */
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
+                     "\"state_schema_version\":1,\"correlation_id\":\"c\","
+                     "\"state\":\"issued\",\"verifier\":\"" RCPT_HX "\","
+                     "\"actor_uid\":1000,\"verb\":\"apt.install\",\"resource\":"
+                     "\"nginx\",\"plan_schema\":1,\"plan_hash\":\"" RCPT_HX "\","
+                     "\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\"}"),
+          "missing boot_id rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
+                     "\"state_schema_version\":1,\"correlation_id\":\"c\","
+                     "\"state\":\"issued\",\"verifier\":\"" RCPT_HX "\","
+                     "\"actor_uid\":1000,\"verb\":\"apt.install\",\"resource\":"
+                     "\"nginx\",\"plan_schema\":1,\"plan_hash\":\"" RCPT_HX "\","
+                     "\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\",\"boot_id\":"
+                     "\"b\",\"extra\":1}"),
+          "extra key on receipt rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
+                     "\"state_schema_version\":1,\"correlation_id\":\"c\","
+                     "\"correlation_id\":\"d\",\"state\":\"issued\",\"verifier\":"
+                     "\"" RCPT_HX "\",\"actor_uid\":1000,\"verb\":\"apt.install\","
+                     "\"resource\":\"nginx\",\"plan_schema\":1,\"plan_hash\":\""
+                     RCPT_HX "\",\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\","
+                     "\"boot_id\":\"b\"}"),
+          "duplicate key on receipt rejected");
+}
+#undef RCPT
+#undef RCPT_HX
+
 static void test_strict_parsing(void) {
     /* a well-formed intent record (baseline: must parse) */
     const char *ok =
@@ -1736,6 +1847,7 @@ static void test_hashed_scale(void) {
 int main(void) {
     test_record_schema();
     test_rate_record_parse();
+    test_receipt_record();
     test_cross_sink_schema();
     test_strict_parsing();
     test_lifecycle_and_reconstruction();
