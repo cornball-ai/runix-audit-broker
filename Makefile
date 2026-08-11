@@ -65,11 +65,13 @@ test-json: src/json.c tests/test_json.c
 	    -fsanitize=address,undefined -g $^ -o build-test-json $(JSON_LIBS)
 	./build-test-json
 
-# Broker state-machine tests (lifecycle, reconstruction, rotation, rate) against
-# system Jansson, built with ASan/UBSan.
-test-broker: src/broker.c src/record.c src/json.c $(CORE) tests/test_broker.c
-	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) \
-	    -fsanitize=address,undefined -g $^ -o build-test-broker $(JSON_LIBS)
+# Broker state-machine tests (lifecycle, reconstruction, rotation, rate,
+# receipts) against system Jansson + libcrypto, built with ASan/UBSan.
+test-broker: src/broker.c src/record.c src/json.c src/receipt.c $(CORE) \
+             tests/test_broker.c
+	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) $(CRYPTO_CFLAGS) \
+	    -fsanitize=address,undefined -g $^ -o build-test-broker \
+	    $(JSON_LIBS) $(CRYPTO_LIBS)
 	./build-test-broker
 
 # An ASan/UBSan build of the whole broker binary, so the daemon runs under the

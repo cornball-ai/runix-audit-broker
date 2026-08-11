@@ -44,10 +44,10 @@ int main(void) {
                     "4ca495991b7852b855") == 0,
           "sha256(empty) known answer");
 
-    /* a 64-hex receipt-token-shaped input digests deterministically, and two
-     * digests of the same token compare equal in constant time. */
-    const char *tok = "00112233445566778899aabbccddeeff"
-                      "00112233445566778899aabbccddeeff";
+    /* a real 32-hex (128-bit) receipt-token-shaped input digests
+     * deterministically, and two digests of the same token compare equal in
+     * constant time. */
+    const char *tok = "00112233445566778899aabbccddeeff";
     unsigned char d2[RAB_SHA256_LEN];
     CHECK(rab_sha256(tok, strlen(tok), d) == 0, "sha256(token) ok");
     CHECK(rab_sha256(tok, strlen(tok), d2) == 0, "sha256(token) again");
@@ -63,8 +63,7 @@ int main(void) {
     CHECK(rab_sha256_eq(d, d3) == 0, "last-byte difference compares unequal");
 
     /* the digest of a different token differs */
-    const char *tok2 = "00112233445566778899aabbccddeeff"
-                       "00112233445566778899aabbccddee00";
+    const char *tok2 = "00112233445566778899aabbccddee00";
     CHECK(rab_sha256(tok2, strlen(tok2), d3) == 0, "sha256(token2) ok");
     CHECK(rab_sha256_eq(d, d3) == 0, "distinct tokens digest differently");
 

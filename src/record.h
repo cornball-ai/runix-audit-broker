@@ -117,7 +117,7 @@ typedef struct {
     /* RAB_REC_RECEIPT only (correlation_id above is the bound intent's cid). */
     rab_rcpt_state rcpt_state;
     char rcpt_verifier[RAB_HEX64_MAX];
-    long long rcpt_actor_uid;
+    uid_t rcpt_actor_uid; /* range-checked at parse; never a truncating cast */
     char rcpt_verb[RAB_META_MAX];
     char rcpt_resource[RAB_META_MAX];
     long long rcpt_plan_schema;

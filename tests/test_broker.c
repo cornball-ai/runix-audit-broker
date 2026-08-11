@@ -5,6 +5,7 @@
  * plus the core lifecycle. Built against Jansson with ASan/UBSan. */
 #include "../src/broker.h"
 #include "../src/json.h"
+#include "../src/receipt.h"
 #include "../src/record.h"
 
 #include <dirent.h>
@@ -443,19 +444,45 @@ static int parses_ok(const char *s) {
     ",\"plan_hash\":\"" ph "\",\"issue_boottime_us\":\"" ibt "\",\"ttl_us\":" \
     "\"" ttl "\",\"boot_id\":\"b\"}"
 
+/* lowercase-hex encode n bytes into out (2n+1 chars including NUL). */
+static void rcpt_hex(const unsigned char *in, size_t n, char *out) {
+    static const char h[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2 * i] = h[in[i] >> 4];
+        out[2 * i + 1] = h[in[i] & 0x0f];
+    }
+    out[2 * n] = '\0';
+}
+
 /* broker_receipt durable format: build -> parse round trip, the verifier-only
  * invariant (Gate 1), and strict fail-closed on malformed/inconsistent records
  * (Gate 4). */
 static void test_receipt_record(void) {
+    /* Gate 1 (strong): a real 128-bit receipt token (32 hex), its true SHA-256
+     * verifier derived here; the built record must carry the verifier and NOT
+     * the live token. */
+    {
+        const char *tok = "00112233445566778899aabbccddeeff"; /* 32 hex, 128-bit */
+        unsigned char vraw[RAB_SHA256_LEN];
+        char vhex[RAB_SHA256_HEX_MAX];
+        CHECK(rab_sha256(tok, strlen(tok), vraw) == 0, "verifier derived");
+        rcpt_hex(vraw, RAB_SHA256_LEN, vhex);
+        char *g = rab_build_receipt("cid-g1", RAB_RCPT_ISSUED, vhex, 1000,
+                                    "apt.install", "nginx", 1, RCPT_HX, 1ull,
+                                    2ull, "b");
+        CHECK(g != NULL, "receipt built with a real verifier");
+        if (g != NULL) {
+            CHECK(strstr(g, tok) == NULL, "the live receipt token is absent");
+            CHECK(strstr(g, vhex) != NULL, "the verifier is present");
+            free(g);
+        }
+    }
+
     char *line = rab_build_receipt("cid-r1", RAB_RCPT_ISSUED, RCPT_HX, 1000,
                                    "apt.install", "nginx", 1, RCPT_HX, 500000ull,
                                    30000000ull, "boot-xyz");
     CHECK(line != NULL, "receipt record built");
     if (line != NULL) {
-        /* Gate 1: only the verifier is persisted, never a live token. */
-        CHECK(strstr(line, "\"verifier\":\"" RCPT_HX "\"") != NULL,
-              "receipt carries the verifier");
-        CHECK(strstr(line, "token") == NULL, "receipt carries no token field");
         rab_stored s;
         CHECK(rab_parse_stored(line, strlen(line), &s) == 0, "receipt parses");
         CHECK(s.type == RAB_REC_RECEIPT, "parsed as receipt");
@@ -504,6 +531,9 @@ static void test_receipt_record(void) {
     CHECK(!parses_ok(RCPT("1", "issued", RCPT_HX, "-1", "1", RCPT_HX, "5",
                           "30")),
           "negative actor_uid rejected");
+    CHECK(!parses_ok(RCPT("1", "issued", RCPT_HX, "99999999999", "1", RCPT_HX,
+                          "5", "30")),
+          "actor_uid outside uid_t rejected (no truncation)");
     CHECK(!parses_ok(RCPT("1", "issued", RCPT_HX, "1000", "0", RCPT_HX, "5",
                           "30")),
           "plan_schema 0 rejected");
@@ -537,6 +567,27 @@ static void test_receipt_record(void) {
                      RCPT_HX "\",\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\","
                      "\"boot_id\":\"b\"}"),
           "duplicate key on receipt rejected");
+
+    /* the builder is itself fail-closed: it never emits a record the parser
+     * would reject, and never silently coerces an unknown state to "issued". */
+    CHECK(rab_build_receipt("c", (rab_rcpt_state) 7, RCPT_HX, 1, "v", "r", 1,
+                            RCPT_HX, 1, 2, "b") == NULL,
+          "builder rejects an unknown state");
+    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, "nothex", 1, "v", "r", 1,
+                            RCPT_HX, 1, 2, "b") == NULL,
+          "builder rejects a malformed verifier");
+    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, RCPT_HX, 1, "v", "r", 1,
+                            "nothex", 1, 2, "b") == NULL,
+          "builder rejects a malformed plan_hash");
+    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, RCPT_HX, 1, "v", "r", 0,
+                            RCPT_HX, 1, 2, "b") == NULL,
+          "builder rejects plan_schema 0");
+    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, RCPT_HX, 1, "", "r", 1,
+                            RCPT_HX, 1, 2, "b") == NULL,
+          "builder rejects an empty verb");
+    CHECK(rab_build_receipt("", RAB_RCPT_ISSUED, RCPT_HX, 1, "v", "r", 1,
+                            RCPT_HX, 1, 2, "b") == NULL,
+          "builder rejects an empty correlation_id");
 }
 #undef RCPT
 #undef RCPT_HX

@@ -16,6 +16,20 @@ static int copy_bounded(char *dst, size_t cap, const char *src) {
     return 0;
 }
 
+/* A 64-char lowercase-hex string (SHA-256 verifier or plan digest). NULL fails. */
+static int is_hex64_lc(const char *s) {
+    if (s == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < 64; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return 0;
+        }
+    }
+    return s[64] == '\0';
+}
+
 /* time_us -> "YYYY-MM-DDTHH:MM:SSZ" (RFC 3339 UTC, seconds precision, matching
  * the R sink's canonical `time`). Returns 0 on success, -1 on failure. */
 static int format_rfc3339(unsigned long long time_us, char *buf, size_t cap) {
@@ -203,6 +217,19 @@ char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
                         long long plan_schema, const char *plan_hash,
                         unsigned long long issue_boottime_us,
                         unsigned long long ttl_us, const char *boot_id) {
+    /* Fail closed on any input the strict parser would later reject, and never
+     * silently coerce an unknown state to "issued": the builder is as strict as
+     * rab_parse_stored, so a bad receipt is never written in the first place. */
+    if (correlation_id == NULL || correlation_id[0] == '\0' ||
+        strlen(correlation_id) >= RAB_CID_MAX ||
+        (state != RAB_RCPT_ISSUED && state != RAB_RCPT_REDEEMED) ||
+        !is_hex64_lc(verifier_hex) || !is_hex64_lc(plan_hash) ||
+        verb == NULL || verb[0] == '\0' || strlen(verb) >= RAB_META_MAX ||
+        resource == NULL || strlen(resource) >= RAB_META_MAX ||
+        plan_schema < 1 || boot_id == NULL || boot_id[0] == '\0' ||
+        strlen(boot_id) >= RAB_BOOT_ID_MAX) {
+        return NULL;
+    }
     json_t *root = json_object();
     if (root == NULL) {
         return NULL;
@@ -289,17 +316,6 @@ static int parse_u64_strict(const char *s, unsigned long long *out) {
     }
     *out = v;
     return 0;
-}
-
-/* A 64-char lowercase-hex string (SHA-256 verifier or plan digest). */
-static int is_hex64_lc(const char *s) {
-    for (size_t i = 0; i < 64; i++) {
-        char c = s[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
-            return 0;
-        }
-    }
-    return s[64] == '\0';
 }
 
 /* Validate and load the broker.peer object exactly. */
@@ -489,10 +505,15 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
             goto done;
         }
         json_t *jauid = json_object_get(root, "actor_uid");
-        if (!json_is_integer(jauid) || json_integer_value(jauid) < 0) {
+        if (!json_is_integer(jauid)) {
             goto done;
         }
-        out->rcpt_actor_uid = (long long) json_integer_value(jauid);
+        json_int_t auid = json_integer_value(jauid);
+        /* reject anything outside uid_t rather than truncating a 64-bit value */
+        if (auid < 0 || (json_int_t) (uid_t) auid != auid) {
+            goto done;
+        }
+        out->rcpt_actor_uid = (uid_t) auid;
         json_t *jverb = json_object_get(root, "verb");
         if (!json_is_string(jverb) || json_string_value(jverb)[0] == '\0' ||
             copy_bounded(out->rcpt_verb, sizeof out->rcpt_verb,
