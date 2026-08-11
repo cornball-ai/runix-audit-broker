@@ -717,12 +717,14 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
     /* Effect-receipt issuance is not yet backed by durable receipt state, so an
      * open_intent requesting an effect FAILS CLOSED here. It must never be
      * downgraded to an ordinary intent, which would silently drop the effect
-     * binding. This guard is replaced by real issuance once receipt state,
-     * persistence, and reconstruction all exist; until then the capability
-     * stays unadvertised, so no conforming client reaches this path. */
+     * binding. Until issuance lands this reuses the existing, contracted
+     * `schema_invalid` refusal (a code the R/helper adapters already accept)
+     * rather than emitting an uncontracted one; the guard is removed once
+     * issuance exists, and the capability stays unadvertised so no conforming
+     * client reaches this path. */
     if (req->effect_present) {
         return reply(resp, rab_response_error(
-                               "effect_unsupported",
+                               "schema_invalid",
                                "effect receipts are not available on this broker"));
     }
     unsigned long long now = b->clock(b->clock_ctx);

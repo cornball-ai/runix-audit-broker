@@ -68,10 +68,10 @@ int rab_make_receipt(char *buf, size_t buflen) {
     if (buflen < RAB_RECEIPT_MAX) {
         return -1;
     }
-    unsigned char rnd[32];
+    unsigned char rnd[16];
     if (fill_random(rnd, sizeof rnd) != 0) {
         return -1;
     }
-    to_hex(rnd, sizeof rnd, buf); /* 64 hex chars + NUL */
+    to_hex(rnd, sizeof rnd, buf); /* 32 hex chars + NUL (128-bit) */
     return 0;
 }

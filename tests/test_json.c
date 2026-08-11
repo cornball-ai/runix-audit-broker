@@ -133,7 +133,6 @@ int main(void) {
                         "\"plan_hash\":\"" HEX64 "\"}}";
         CHECK(rab_parse_request(b, strlen(b), &req, &err) == 0, "parse effect");
         CHECK(req.effect_present == 1, "effect present flagged");
-        CHECK(req.effect_required == 1, "effect required extracted");
         CHECK(req.effect_plan_schema == 2, "plan_schema extracted");
         CHECK(strcmp(req.effect_plan_hash, HEX64) == 0, "plan_hash extracted");
         rab_request_free(&req);
@@ -167,6 +166,20 @@ int main(void) {
                        "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
                        "\"plan_schema\":0,\"plan_hash\":\"" HEX64 "\"}}"),
                  "schema_invalid") == 0, "effect plan_schema 0 rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_schema\":-1,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "effect negative plan_schema rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_schema\":1.5,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "effect real-valued plan_schema rejected");
+    /* `required` must be literal true: false and non-boolean are both rejected,
+     * since the presence of `effect` is itself the opt-in. */
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":false,"
+                       "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "effect required:false rejected");
     CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
                        "\"outcome\":\"intent\"},\"effect\":{\"required\":\"yes\","
                        "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "\"}}"),

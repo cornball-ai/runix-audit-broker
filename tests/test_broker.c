@@ -1147,8 +1147,9 @@ static void test_effect_fail_closed(void) {
     int rc = rab_broker_handle(b, &a, &req, &resp);
     rab_request_free(&req);
     CHECK(rc == 0 && resp != NULL, "effect open handled");
-    CHECK(resp != NULL && strstr(resp, "\"error\":\"effect_unsupported\"") != NULL,
-          "effect request refused effect_unsupported");
+    /* refused with an existing contracted code (issuance replaces this guard) */
+    CHECK(resp != NULL && strstr(resp, "\"error\":\"schema_invalid\"") != NULL,
+          "effect request refused (schema_invalid, an accepted code)");
     free(resp);
 
     /* no downgrade: nothing opened, sink grew by zero bytes */

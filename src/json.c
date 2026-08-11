@@ -155,9 +155,11 @@ static int is_hex64(const char *s) {
     return s[64] == '\0';
 }
 
-/* An open_intent `effect` object is exactly {required: bool, plan_schema:
- * int >= 1, plan_hash: 64 lowercase hex}. Grammar only; the broker decides
- * whether it can honour the request. */
+/* An open_intent `effect` object is exactly {required: true, plan_schema:
+ * int >= 1, plan_hash: 64 lowercase hex}. `required` must be literal `true`:
+ * the presence of `effect` IS the opt-in, so a `false` (or non-boolean) value
+ * is rejected rather than left as an ambiguous downgrade path. Grammar only;
+ * the broker decides whether it can honour the request. */
 static int effect_valid(json_t *e) {
     if (!json_is_object(e)) {
         return 0;
@@ -169,7 +171,7 @@ static int effect_valid(json_t *e) {
     json_t *req = json_object_get(e, "required");
     json_t *ps = json_object_get(e, "plan_schema");
     json_t *ph = json_object_get(e, "plan_hash");
-    if (!json_is_boolean(req) || !json_is_integer(ps) ||
+    if (!json_is_true(req) || !json_is_integer(ps) ||
         json_integer_value(ps) < 1 || !json_is_string(ph)) {
         return 0;
     }
@@ -184,7 +186,6 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
     req->binding[0] = '\0';
     req->phase[0] = '\0';
     req->effect_present = 0;
-    req->effect_required = 0;
     req->effect_plan_schema = 0;
     req->effect_plan_hash[0] = '\0';
 
@@ -228,9 +229,7 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
                 *errcode = "schema_invalid";
                 return -1;
             }
-            req->effect_present = 1;
-            req->effect_required =
-                json_is_true(json_object_get(effect, "required")) ? 1 : 0;
+            req->effect_present = 1; /* effect_valid guaranteed required==true */
             req->effect_plan_schema =
                 json_integer_value(json_object_get(effect, "plan_schema"));
             memcpy(req->effect_plan_hash,
