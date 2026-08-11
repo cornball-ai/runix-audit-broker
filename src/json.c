@@ -230,6 +230,15 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
         memcpy(req->phase, ph, pl);
         req->phase[pl] = '\0';
         req->type = RAB_REQ_EMIT;
+    } else if (strcmp(type, "capabilities") == 0) {
+        /* discovery only: read-only, no record, no binding, opens no intent. */
+        static const char *const allowed[] = {"type"};
+        if (!only_keys(root, allowed, 1)) {
+            json_decref(root);
+            *errcode = "schema_invalid";
+            return -1;
+        }
+        req->type = RAB_REQ_CAPABILITIES;
     } else {
         json_decref(root);
         *errcode = "unknown_request";
@@ -289,6 +298,27 @@ char *rab_response_emit_ok(const char *correlation_id, const char *audit_scope) 
     json_object_set_new(o, "correlation_id", json_string(correlation_id));
     json_object_set_new(o, "persisted", json_true());
     json_object_set_new(o, "audit_scope", json_string(audit_scope));
+    return dump_compact(o);
+}
+
+char *rab_response_capabilities(void) {
+    json_t *o = json_object();
+    json_t *ext = json_object();
+    json_t *schemas = json_array();
+    if (o == NULL || ext == NULL || schemas == NULL) {
+        json_decref(o);
+        json_decref(ext);
+        json_decref(schemas);
+        return NULL;
+    }
+    json_object_set_new(o, "ok", json_true());
+    json_object_set_new(o, "frame_version", json_integer(1));
+    json_object_set_new(o, "record_schema_version", json_integer(1));
+    /* effect_receipt is advertised (and plan_schemas populated) only once the
+     * broker actually honours redemption; until then the map is empty so a
+     * client never assumes a capability the broker cannot back. */
+    json_object_set_new(o, "extensions", ext);
+    json_object_set_new(o, "plan_schemas", schemas);
     return dump_compact(o);
 }
 

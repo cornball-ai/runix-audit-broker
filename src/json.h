@@ -18,7 +18,8 @@
 typedef enum {
     RAB_REQ_OPEN_INTENT,
     RAB_REQ_WRITE_OUTCOME,
-    RAB_REQ_EMIT
+    RAB_REQ_EMIT,
+    RAB_REQ_CAPABILITIES
 } rab_req_type;
 
 typedef struct {
@@ -49,6 +50,10 @@ char *rab_response_open_ok(const char *correlation_id, const char *binding,
 char *rab_response_outcome_ok(void);
 /* emit success: a minted correlation id and no binding (opens no intent). */
 char *rab_response_emit_ok(const char *correlation_id, const char *audit_scope);
+/* capability negotiation: what this broker supports. `extensions` is empty and
+ * `plan_schemas` is [] until the effect-receipt capability is honoured; a client
+ * treats an absent `effect_receipt` member as "receipts unsupported". */
+char *rab_response_capabilities(void);
 char *rab_response_error(const char *code, const char *message);
 
 #endif /* RAB_JSON_H */

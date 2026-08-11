@@ -96,6 +96,27 @@ int main(void) {
                        "\"outcome\":\"o\"}}"), "schema_invalid") == 0,
           "emit without a phase rejected");
 
+    /* --- capabilities: discovery, read-only, no record/binding --- */
+    CHECK(strcmp(PARSE("{\"type\":\"capabilities\"}"), "OK") == 0,
+          "valid capabilities");
+    {
+        rab_request req;
+        const char *err = NULL;
+        const char *b = "{\"type\":\"capabilities\"}";
+        CHECK(rab_parse_request(b, strlen(b), &req, &err) == 0, "parse caps");
+        CHECK(req.type == RAB_REQ_CAPABILITIES, "type is capabilities");
+        CHECK(req.record == NULL, "caps carries no record");
+        CHECK(req.binding[0] == '\0', "caps carries no binding");
+        CHECK(req.phase[0] == '\0', "caps carries no phase");
+        rab_request_free(&req);
+    }
+    /* capabilities takes no other field: it is pure discovery */
+    CHECK(strcmp(PARSE("{\"type\":\"capabilities\",\"record\":"
+                       "{\"operation\":\"x\",\"outcome\":\"i\"}}"),
+                 "schema_invalid") == 0, "caps with a record rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"capabilities\",\"binding\":\"x\"}"),
+                 "schema_invalid") == 0, "caps with a binding rejected");
+
     /* --- duplicate keys rejected (JSON_REJECT_DUPLICATES) --- */
     CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"type\":\"open_intent\","
                        "\"record\":{\"operation\":\"x\",\"outcome\":\"i\"}}"),
@@ -180,6 +201,12 @@ int main(void) {
         CHECK(r != NULL && strcmp(r,
             "{\"audit_scope\":\"system\",\"correlation_id\":\"cid1\","
             "\"ok\":true,\"persisted\":true}") == 0, "emit_ok golden bytes");
+        free(r);
+        r = rab_response_capabilities();
+        CHECK(r != NULL && strcmp(r,
+            "{\"extensions\":{},\"frame_version\":1,\"ok\":true,"
+            "\"plan_schemas\":[],\"record_schema_version\":1}") == 0,
+            "capabilities golden bytes");
         free(r);
         r = rab_response_error("schema_invalid", "nope");
         CHECK(r != NULL && strcmp(r,
