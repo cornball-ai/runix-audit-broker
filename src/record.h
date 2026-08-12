@@ -32,6 +32,20 @@
 #define RAB_META_MAX 128
 #define RAB_SCOPE_MAX 32
 
+/* 64 lowercase-hex chars + NUL: a SHA-256 verifier or a plan-hash digest.
+ * (RAB_BOOT_ID_MAX for the receipt's boot id comes from peer.h.) */
+#define RAB_HEX64_MAX 65
+
+/* On-disk broker-STATE schema version: the durable receipt representation
+ * (broker_receipt), distinct from RAB_RECORD_SCHEMA_VERSION (the public
+ * audit-record schema) and from the wire capability version. It gates receipt
+ * reconstruction and evolves independently. */
+#define RAB_BROKER_STATE_SCHEMA_VERSION 1
+
+/* Receipt lifecycle state. issued -> redeemed is the only durable transition
+ * (expired is derived from the TTL/boot-id at read time, never persisted). */
+typedef enum { RAB_RCPT_ISSUED = 0, RAB_RCPT_REDEEMED = 1 } rab_rcpt_state;
+
 /* Build a canonical "audit" record line. `binding` non-NULL only for intent
  * records (it is sensitive and appears nowhere else). `client_record` is the
  * schema-validated domain object (borrowed); its keys are merged in canonical
@@ -61,7 +75,29 @@ char *rab_build_checkpoint(const char *correlation_id, const char *binding,
 char *rab_build_rate(uid_t uid, const unsigned long long *times,
                      const unsigned long long *bytes, size_t n);
 
-typedef enum { RAB_REC_AUDIT, RAB_REC_CHECKPOINT, RAB_REC_RATE } rab_rec_type;
+/* Build a `broker_receipt` record line: the durable effect-receipt state bound
+ * to an open intent's `correlation_id`. It carries the SHA-256 `verifier` of the
+ * receipt token (NEVER the live token), the bound {actor_uid, verb, resource,
+ * plan_schema, plan_hash}, the CLOCK_BOOTTIME issue time + TTL, and the boot id.
+ * `state` is RAB_RCPT_ISSUED or RAB_RCPT_REDEEMED. `checkpoint` marks a
+ * rotation carry-forward (the full current state, which stands alone on
+ * reconstruction) versus a transition record (a delta: a `redeemed` transition
+ * requires a prior `issued`). Returns a malloc'd line or NULL (also NULL if any
+ * input is invalid: the builder is as strict as rab_parse_stored). */
+char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
+                        int checkpoint, const char *verifier_hex, uid_t actor_uid,
+                        const char *verb, const char *resource,
+                        long long plan_schema, const char *plan_hash,
+                        unsigned long long issue_boottime_us,
+                        unsigned long long ttl_us, const char *boot_id,
+                        unsigned long long accepted_time_us);
+
+typedef enum {
+    RAB_REC_AUDIT,
+    RAB_REC_CHECKPOINT,
+    RAB_REC_RATE,
+    RAB_REC_RECEIPT
+} rab_rec_type;
 
 /* The broker-owned facts recovered from one stored line. */
 typedef struct {
@@ -81,6 +117,22 @@ typedef struct {
     unsigned long long *rate_times;
     unsigned long long *rate_bytes;
     size_t rate_n;
+    /* RAB_REC_RECEIPT only (correlation_id above is the bound intent's cid). */
+    rab_rcpt_state rcpt_state;
+    int rcpt_is_checkpoint; /* 1 = rotation carry (stands alone), 0 = transition */
+    char rcpt_verifier[RAB_HEX64_MAX];
+    uid_t rcpt_actor_uid; /* range-checked at parse; never a truncating cast */
+    char rcpt_verb[RAB_META_MAX];
+    char rcpt_resource[RAB_META_MAX];
+    long long rcpt_plan_schema;
+    char rcpt_plan_hash[RAB_HEX64_MAX];
+    unsigned long long rcpt_issue_boottime_us;
+    unsigned long long rcpt_ttl_us;
+    char rcpt_boot_id[RAB_BOOT_ID_MAX];
+    /* broker-assigned wall-clock accept time of THIS receipt append, for
+     * reconstructing its per-uid rate/byte charge on a plain restart (parallel
+     * to an audit record's accepted_time_us). */
+    unsigned long long rcpt_accepted_time_us;
 } rab_stored;
 
 /* Parse one stored line into *out. Returns 0 on a well-formed broker record,

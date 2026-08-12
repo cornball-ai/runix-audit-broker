@@ -8,6 +8,7 @@
 
 #define RAB_CID_MAX 64u     /* buffer for a correlation id incl. NUL */
 #define RAB_BINDING_MAX 33u /* 32 hex chars + NUL */
+#define RAB_RECEIPT_MAX 33u /* 32 hex chars (16 getrandom bytes, 128-bit) + NUL */
 
 /* Write a time-orderable correlation id into buf:
  * "<20-digit microsecond timestamp>-<16 hex random>". The timestamp makes it
@@ -17,5 +18,10 @@ int rab_make_correlation_id(char *buf, size_t buflen);
 /* Write an unguessable binding token (32 hex chars = 16 getrandom bytes) into
  * buf. buf must be at least RAB_BINDING_MAX. 0 on success, -1 on error. */
 int rab_make_binding(char *buf, size_t buflen);
+
+/* Write an unguessable opaque effect-receipt token (32 hex chars = 16 getrandom
+ * bytes, 128-bit, per the effect-receipt contract) into buf. A token distinct
+ * from the outcome binding. buf must be at least RAB_RECEIPT_MAX. 0/-1. */
+int rab_make_receipt(char *buf, size_t buflen);
 
 #endif /* RAB_ID_H */

@@ -28,19 +28,31 @@ One request frame yields exactly one response frame (same framing).
 
 ## Requests (client -> broker)
 
-Exactly four `type`s. Any other is `unknown_request`. (The effect-receipt
-capability, once it lands, adds a fifth, `redeem_receipt`; it is discoverable
-via `capabilities` and absent until then.)
+Exactly five `type`s. Any other is `unknown_request`. The fifth,
+`redeem_receipt`, is the effect-receipt capability's pre-commit redemption,
+discoverable via `capabilities` (a broker without the capability does not
+recognise it). See `broker-effect-receipt-contract.md` for the full capability.
 
 ```jsonc
-// open an intent (before the effect is issued)
+// open an intent (before the effect). `effect` is OPTIONAL and opt-in: when
+// present, the broker issues an effect receipt bound to this intent and returns
+// it in the response (below). Absent = today's behaviour, no receipt.
 { "type": "open_intent",
-  "record": { /* durable-audit domain content: operation, resource, ... */ } }
+  "record": { /* durable-audit domain content: operation, resource, ... */ },
+  "effect": { "required": true, "plan_schema": 1, "plan_hash": "<64 hex>" } }
 
 // write the outcome (after the effect), bound to the intent's receipt
 { "type": "write_outcome",
   "binding": "<opaque token from the open_intent response>",
   "record": { /* domain content: outcome, effect_issued, observed, ... */ } }
+
+// redeem an effect receipt (from the ROOT helper, before it commits). Token-
+// addressed: it carries the opaque receipt, never a correlation id.
+{ "type": "redeem_receipt",
+  "effect_receipt": "<opaque 32-hex token, via stdin/private FD, never argv/env>",
+  "principal_uid": 1000,                  // the original invoking uid (PKEXEC_UID)
+  "effect": { "operation": "apt.install", "resource": "nginx",
+              "plan_schema": 1, "plan_hash": "<64 hex>" } }
 
 // emit a single non-effect record (a preview or a pre-effect no-op)
 { "type": "emit",
@@ -80,12 +92,18 @@ like the effect paths.
 ## Responses (broker -> client)
 
 ```jsonc
-// open_intent success
+// open_intent success. `effect_receipt` is present ONLY for an effect open (a
+// distinct token from `binding`, guaranteed different at mint); an ordinary
+// open omits the member entirely.
 { "ok": true, "correlation_id": "<minted>", "binding": "<opaque>",
-  "persisted": true, "audit_scope": "system" }
+  "effect_receipt": "<opaque>", "persisted": true, "audit_scope": "system" }
 
 // write_outcome success
 { "ok": true, "persisted": true }
+
+// redeem_receipt success: a correlation id only (no binding, no audit_scope --
+// it authorizes a commit, it opens no durable-audit record)
+{ "ok": true, "correlation_id": "<minted>", "persisted": true }
 
 // emit success (no binding: it opens no intent)
 { "ok": true, "correlation_id": "<minted>", "persisted": true,
@@ -93,18 +111,16 @@ like the effect paths.
 
 // capabilities (read-only discovery; writes nothing, opens no intent)
 { "ok": true, "frame_version": 1, "record_schema_version": 1,
-  "extensions": { /* "effect_receipt": N when supported; absent => unsupported */ },
-  "plan_schemas": [ /* accepted plan-digest encodings; [] when none */ ] }
-
-// any error (typed, closed set)
-{ "ok": false, "error": "<code>", "message": "<human detail>" }
+  "extensions": { "effect_receipt": 1 },   // absent => unsupported
+  "plan_schemas": [ 1 ] }                   // the accepted plan-digest schemas
 ```
 
 `frame_version` and `record_schema_version` are emitted from the same
 `RAB_PROTO_VERSION` / `RAB_RECORD_SCHEMA_VERSION` constants the broker stamps and
 validates records with, so the advertised versions cannot drift from the
-implementation. `extensions` is empty and `plan_schemas` is `[]` until the
-broker actually honours the corresponding capability.
+implementation. This broker honours the effect-receipt capability, so
+`extensions` carries `effect_receipt: 1` and `plan_schemas` is `[1]`; a broker
+that did not would omit `effect_receipt` and leave `plan_schemas` empty.
 
 Error codes (closed set; deterministic per input):
 
@@ -113,13 +129,20 @@ Error codes (closed set; deterministic per input):
 | `bad_frame` | version wrong, or a truncated/interrupted frame |
 | `too_large` | body length exceeds the maximum |
 | `bad_json` | body is not valid UTF-8 JSON, or has trailing content |
-| `unknown_request` | `type` is not `open_intent`/`write_outcome`/`emit`/`capabilities` |
+| `unknown_request` | `type` is not `open_intent`/`write_outcome`/`emit`/`redeem_receipt`/`capabilities` |
 | `schema_invalid` | record fails schema/type/range/extra-field checks |
 | `unknown_intent` | `binding` matches no open intent |
 | `actor_mismatch` | `binding` belongs to a different `SO_PEERCRED` actor |
 | `rate_limited` | per-actor rate/quota exceeded |
 | `persist_failed` | the durable append or fsync failed |
 | `internal` | unexpected broker fault |
+| `receipt_invalid` | `redeem_receipt`: no such effect receipt (unknown token) |
+| `receipt_expired` | `redeem_receipt`: past its TTL, or the boot id changed |
+| `receipt_redeemed` | `redeem_receipt`: already redeemed (single-use) |
+| `receipt_mismatch` | `redeem_receipt`: verb/resource/`plan_hash`/`plan_schema` differ from the bound values |
+| `receipt_unauthorized` | `redeem_receipt`: the redeeming peer is not uid 0 |
+| `receipt_actor_mismatch` | `redeem_receipt`: `principal_uid` differs from the bound original actor |
+| `effect_without_receipt` | `write_outcome` with `effect_issued: true` on an effect intent whose receipt was never redeemed |
 
 This is a **closed** set: the R adapter rejects any error code outside it, so a
 new code is a contract change touched on both sides.

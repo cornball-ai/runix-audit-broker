@@ -144,6 +144,75 @@ static int only_keys(json_t *obj, const char *const *allowed, size_t n) {
     return 1;
 }
 
+/* Exactly n lowercase-hex chars then NUL. */
+static int is_hex_lc_n(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return 0;
+        }
+    }
+    return s[n] == '\0';
+}
+
+/* A 64-char lowercase-hex string (a SHA-256 digest), NUL-terminated at 64. */
+static int is_hex64(const char *s) { return is_hex_lc_n(s, 64); }
+
+/* An open_intent `effect` object is exactly {required: true, plan_schema:
+ * int >= 1, plan_hash: 64 lowercase hex}. `required` must be literal `true`:
+ * the presence of `effect` IS the opt-in, so a `false` (or non-boolean) value
+ * is rejected rather than left as an ambiguous downgrade path. Grammar only;
+ * the broker decides whether it can honour the request. */
+static int effect_valid(json_t *e) {
+    if (!json_is_object(e)) {
+        return 0;
+    }
+    static const char *const ek[] = {"required", "plan_schema", "plan_hash"};
+    if (!only_keys(e, ek, 3)) {
+        return 0;
+    }
+    json_t *req = json_object_get(e, "required");
+    json_t *ps = json_object_get(e, "plan_schema");
+    json_t *ph = json_object_get(e, "plan_hash");
+    /* plan_schema must be a schema this broker actually offers (advertised in
+     * capabilities.plan_schemas); an unadvertised one is refused, not bound. */
+    if (!json_is_true(req) || !json_is_integer(ps) ||
+        json_integer_value(ps) != RAB_PLAN_SCHEMA_V1 || !json_is_string(ph)) {
+        return 0;
+    }
+    return is_hex64(json_string_value(ph));
+}
+
+/* A redeem_receipt `effect` object is exactly {operation: string, resource:
+ * string, plan_schema: int >= 1, plan_hash: 64 lowercase hex}. Distinct from the
+ * open_intent `effect` ({required, plan_schema, plan_hash}): here the helper
+ * presents the verb/resource and plan its atomic resolve produced, to match the
+ * values bound into the receipt at issue. verb/resource longer than a bound
+ * field can never match, so an over-length one is refused, not truncated. */
+static int redeem_effect_valid(json_t *e) {
+    if (!json_is_object(e)) {
+        return 0;
+    }
+    static const char *const ek[] = {"operation", "resource", "plan_schema",
+                                     "plan_hash"};
+    if (!only_keys(e, ek, 4)) {
+        return 0;
+    }
+    json_t *op = json_object_get(e, "operation");
+    json_t *rs = json_object_get(e, "resource");
+    json_t *ps = json_object_get(e, "plan_schema");
+    json_t *ph = json_object_get(e, "plan_hash");
+    if (!json_is_string(op) || !json_is_string(rs) || !json_is_integer(ps) ||
+        json_integer_value(ps) != RAB_PLAN_SCHEMA_V1 || !json_is_string(ph)) {
+        return 0; /* only an advertised plan schema is accepted */
+    }
+    if (strlen(json_string_value(op)) >= RAB_REDEEM_STR_MAX ||
+        strlen(json_string_value(rs)) >= RAB_REDEEM_STR_MAX) {
+        return 0;
+    }
+    return is_hex64(json_string_value(ph));
+}
+
 int rab_parse_request(const char *body, size_t len, rab_request *req,
                       const char **errcode) {
     *errcode = "bad_json";
@@ -151,6 +220,15 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
     req->record = NULL;
     req->binding[0] = '\0';
     req->phase[0] = '\0';
+    req->effect_present = 0;
+    req->effect_plan_schema = 0;
+    req->effect_plan_hash[0] = '\0';
+    req->effect_receipt[0] = '\0';
+    req->redeem_principal_uid = 0;
+    req->redeem_verb[0] = '\0';
+    req->redeem_resource[0] = '\0';
+    req->redeem_plan_schema = 0;
+    req->redeem_plan_hash[0] = '\0';
 
     json_error_t jerr;
     /* JSON_REJECT_DUPLICATES: reject duplicate keys. No JSON_DISABLE_EOF_CHECK
@@ -177,12 +255,27 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
     json_t *record = json_object_get(root, "record");
 
     if (strcmp(type, "open_intent") == 0) {
-        static const char *const allowed[] = {"type", "record"};
-        if (!only_keys(root, allowed, 2) || !json_is_object(record) ||
+        static const char *const allowed[] = {"type", "record", "effect"};
+        json_t *effect = json_object_get(root, "effect");
+        if (!only_keys(root, allowed, 3) || !json_is_object(record) ||
             !record_valid(record)) {
             json_decref(root);
             *errcode = "schema_invalid";
             return -1;
+        }
+        if (effect != NULL) {
+            /* an effect request is opt-in; when present its grammar is exact. */
+            if (!effect_valid(effect)) {
+                json_decref(root);
+                *errcode = "schema_invalid";
+                return -1;
+            }
+            req->effect_present = 1; /* effect_valid guaranteed required==true */
+            req->effect_plan_schema =
+                json_integer_value(json_object_get(effect, "plan_schema"));
+            memcpy(req->effect_plan_hash,
+                   json_string_value(json_object_get(effect, "plan_hash")), 64);
+            req->effect_plan_hash[64] = '\0';
         }
         req->type = RAB_REQ_OPEN_INTENT;
     } else if (strcmp(type, "write_outcome") == 0) {
@@ -242,6 +335,47 @@ int rab_parse_request(const char *body, size_t len, rab_request *req,
             return -1;
         }
         req->type = RAB_REQ_CAPABILITIES;
+    } else if (strcmp(type, "redeem_receipt") == 0) {
+        /* the ROOT helper's pre-commit redemption. The opaque token, the pkexec
+         * principal, and the plan the atomic resolve produced. The token grammar
+         * is validated HERE, before the broker hashes it; the broker looks the
+         * receipt up by the token's verifier (no correlation id in the request). */
+        static const char *const allowed[] = {"type", "effect_receipt",
+                                              "principal_uid", "effect"};
+        json_t *jtok = json_object_get(root, "effect_receipt");
+        json_t *jprin = json_object_get(root, "principal_uid");
+        json_t *jeff = json_object_get(root, "effect");
+        if (!only_keys(root, allowed, 4) || !json_is_string(jtok) ||
+            !json_is_integer(jprin) || !redeem_effect_valid(jeff)) {
+            json_decref(root);
+            *errcode = "schema_invalid";
+            return -1;
+        }
+        const char *tok = json_string_value(jtok);
+        if (!is_hex_lc_n(tok, 32)) { /* exactly 32 lowercase hex, before hashing */
+            json_decref(root);
+            *errcode = "schema_invalid";
+            return -1;
+        }
+        json_int_t prin = json_integer_value(jprin);
+        if (prin < 0 || (json_int_t) (uid_t) prin != prin) { /* fits uid_t */
+            json_decref(root);
+            *errcode = "schema_invalid";
+            return -1;
+        }
+        memcpy(req->effect_receipt, tok, 32);
+        req->effect_receipt[32] = '\0';
+        req->redeem_principal_uid = (uid_t) prin;
+        snprintf(req->redeem_verb, sizeof req->redeem_verb, "%s",
+                 json_string_value(json_object_get(jeff, "operation")));
+        snprintf(req->redeem_resource, sizeof req->redeem_resource, "%s",
+                 json_string_value(json_object_get(jeff, "resource")));
+        req->redeem_plan_schema =
+            json_integer_value(json_object_get(jeff, "plan_schema"));
+        memcpy(req->redeem_plan_hash,
+               json_string_value(json_object_get(jeff, "plan_hash")), 64);
+        req->redeem_plan_hash[64] = '\0';
+        req->type = RAB_REQ_REDEEM;
     } else {
         json_decref(root);
         *errcode = "unknown_request";
@@ -269,7 +403,7 @@ static char *dump_compact(json_t *obj) {
 }
 
 char *rab_response_open_ok(const char *correlation_id, const char *binding,
-                           const char *audit_scope) {
+                           const char *audit_scope, const char *effect_receipt) {
     json_t *o = json_object();
     if (o == NULL) {
         return NULL;
@@ -277,8 +411,24 @@ char *rab_response_open_ok(const char *correlation_id, const char *binding,
     json_object_set_new(o, "ok", json_true());
     json_object_set_new(o, "correlation_id", json_string(correlation_id));
     json_object_set_new(o, "binding", json_string(binding));
+    /* a receipt-bearing open carries the opaque effect receipt; JSON_SORT_KEYS
+     * places it in canonical position. Omitted entirely for an ordinary open. */
+    if (effect_receipt != NULL) {
+        json_object_set_new(o, "effect_receipt", json_string(effect_receipt));
+    }
     json_object_set_new(o, "persisted", json_true());
     json_object_set_new(o, "audit_scope", json_string(audit_scope));
+    return dump_compact(o);
+}
+
+char *rab_response_redeem_ok(const char *correlation_id) {
+    json_t *o = json_object();
+    if (o == NULL) {
+        return NULL;
+    }
+    json_object_set_new(o, "ok", json_true());
+    json_object_set_new(o, "correlation_id", json_string(correlation_id));
+    json_object_set_new(o, "persisted", json_true());
     return dump_compact(o);
 }
 
@@ -318,10 +468,13 @@ char *rab_response_capabilities(void) {
     json_object_set_new(o, "frame_version", json_integer(RAB_PROTO_VERSION));
     json_object_set_new(o, "record_schema_version",
                         json_integer(RAB_RECORD_SCHEMA_VERSION));
-    /* effect_receipt is advertised (and plan_schemas populated) only once the
-     * broker actually honours redemption; until then the map is empty so a
-     * client never assumes a capability the broker cannot back. */
+    /* The effect-receipt capability is honoured: issuance, redemption,
+     * persistence, and reconstruction are all backed, so it is advertised here
+     * with the single plan-digest schema the broker offers. */
+    json_object_set_new(ext, "effect_receipt",
+                        json_integer(RAB_EFFECT_RECEIPT_VERSION));
     json_object_set_new(o, "extensions", ext);
+    json_array_append_new(schemas, json_integer(RAB_PLAN_SCHEMA_V1));
     json_object_set_new(o, "plan_schemas", schemas);
     return dump_compact(o);
 }

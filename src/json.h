@@ -11,21 +11,49 @@
 
 #include <jansson.h>
 #include <stddef.h>
+#include <sys/types.h> /* uid_t */
 
 #define RAB_MAX_DEPTH 8       /* records are shallow: object > record > observed */
 #define RAB_BINDING_STR_MAX 128
+#define RAB_PLAN_HASH_MAX 65  /* 64-hex SHA-256 plan digest + NUL */
+#define RAB_RECEIPT_TOKEN_MAX 33 /* 32-hex receipt token (128-bit) + NUL */
+#define RAB_REDEEM_STR_MAX 128   /* redeem effect verb/resource bound */
+
+/* The effect-receipt capability, now honoured: the wire extension version
+ * advertised as extensions.effect_receipt, and the one plan-digest schema the
+ * broker offers in plan_schemas. */
+#define RAB_EFFECT_RECEIPT_VERSION 1
+#define RAB_PLAN_SCHEMA_V1 1
 
 typedef enum {
     RAB_REQ_OPEN_INTENT,
     RAB_REQ_WRITE_OUTCOME,
     RAB_REQ_EMIT,
-    RAB_REQ_CAPABILITIES
+    RAB_REQ_CAPABILITIES,
+    RAB_REQ_REDEEM
 } rab_req_type;
 
 typedef struct {
     rab_req_type type;
     char binding[RAB_BINDING_STR_MAX]; /* write_outcome only; "" otherwise */
     char phase[16];                    /* emit only: "preview"|"noop"; "" else */
+    /* open_intent effect request (opt-in). effect_present == 0 is today's
+     * behaviour; when set, `effect.required` was literal true (the presence of
+     * `effect` is itself the opt-in), the fields are grammar-validated here, and
+     * the broker decides whether it can honour issuance (fail-closed until it
+     * can). */
+    int effect_present;
+    json_int_t effect_plan_schema;            /* effect.plan_schema (>= 1) */
+    char effect_plan_hash[RAB_PLAN_HASH_MAX]; /* effect.plan_hash (64 lc hex) */
+    /* redeem_receipt request. The opaque token's grammar (exactly 32 lowercase
+     * hex) is validated HERE, before the broker ever hashes it; the plan the
+     * helper's atomic resolve produced is presented for the bound-plan match. */
+    char effect_receipt[RAB_RECEIPT_TOKEN_MAX]; /* the opaque 32-hex token */
+    uid_t redeem_principal_uid;                 /* PKEXEC_UID (bound-actor check) */
+    char redeem_verb[RAB_REDEEM_STR_MAX];       /* redeem effect.operation */
+    char redeem_resource[RAB_REDEEM_STR_MAX];   /* redeem effect.resource */
+    json_int_t redeem_plan_schema;              /* redeem effect.plan_schema */
+    char redeem_plan_hash[RAB_PLAN_HASH_MAX];   /* redeem effect.plan_hash */
     json_t *record;                    /* borrowed from root */
     json_t *root;                      /* owned; free via rab_request_free */
 } rab_request;
@@ -45,9 +73,15 @@ int rab_json_depth(const json_t *v);
 
 /* Canonical (compact, sorted-key) response builders. Each returns a malloc'd
  * NUL-terminated string (caller frees) or NULL on allocation failure. */
+/* open_intent success. `effect_receipt` is the opaque receipt token when the
+ * open issued one (a receipt-bearing open_ok), or NULL to omit the member (an
+ * ordinary open_ok). The receipt is a distinct token from `binding`; the caller
+ * guarantees they differ via the mint-time collision check. */
 char *rab_response_open_ok(const char *correlation_id, const char *binding,
-                           const char *audit_scope);
+                           const char *audit_scope, const char *effect_receipt);
 char *rab_response_outcome_ok(void);
+/* redeem_receipt success: a correlation id only (no binding, no audit_scope). */
+char *rab_response_redeem_ok(const char *correlation_id);
 /* emit success: a minted correlation id and no binding (opens no intent). */
 char *rab_response_emit_ok(const char *correlation_id, const char *audit_scope);
 /* capability negotiation: what this broker supports. `extensions` is empty and

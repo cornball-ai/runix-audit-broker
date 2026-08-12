@@ -28,7 +28,8 @@ This is root-privileged code, so the design is deliberately minimal and
 paranoid:
 
 - actor identity from `SO_PEERCRED`, never from the payload;
-- exactly two request types (`open_intent`, `write_outcome`);
+- five request types (`open_intent`, `write_outcome`, `emit`,
+  `redeem_receipt`, `capabilities`);
 - versioned, length-prefixed frames with a hard maximum;
 - strict UTF-8 JSON parsed by system **Jansson** (an audited, apt-serviced
   library with native duplicate-key rejection via `JSON_REJECT_DUPLICATES`)

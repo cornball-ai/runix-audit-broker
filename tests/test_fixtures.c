@@ -116,16 +116,29 @@ int main(void) {
     check_golden("open_ok.json",
                  rab_response_open_ok("00001786382512165708-a061ec02cffe1b2b",
                                       "c7eb72753bf700824daf45442abd39c2",
-                                      "system"),
+                                      "system", NULL),
                  "open_ok builder matches the shared fixture");
+    /* a receipt-bearing open_ok: the effect_receipt is distinct from the binding
+     * and must equal the corpus generator's RECEIPT value byte-for-byte. */
+    check_golden("open_ok_effect.json",
+                 rab_response_open_ok("00001786382512165708-a061ec02cffe1b2b",
+                                      "c7eb72753bf700824daf45442abd39c2", "system",
+                                      "1b9d6bcd1e7f4a3bd2c5e8f0a4d7c9e2"),
+                 "open_ok_effect builder matches the shared fixture");
+    check_golden("redeem_ok.json",
+                 rab_response_redeem_ok("00001786382512165708-a061ec02cffe1b2b"),
+                 "redeem_ok builder matches the shared fixture");
     check_golden("outcome_ok.json", rab_response_outcome_ok(),
                  "outcome_ok builder matches the shared fixture");
     check_golden("emit_ok.json",
                  rab_response_emit_ok("00001786382512165708-a061ec02cffe1b2b",
                                       "system"),
                  "emit_ok builder matches the shared fixture");
-    check_golden("capabilities_ok.json", rab_response_capabilities(),
-                 "capabilities builder matches the shared fixture");
+    /* the capability is honoured now, so the builder emits the POPULATED
+     * capabilities golden (effect_receipt:1, plan_schemas:[1]); the empty
+     * capabilities_ok.json remains a valid shape the parser still accepts. */
+    check_golden("caps_effect_receipt.json", rab_response_capabilities(),
+                 "capabilities builder matches the populated fixture");
     check_golden("error.json", rab_response_error("schema_invalid", "nope"),
                  "error builder matches the shared fixture");
 

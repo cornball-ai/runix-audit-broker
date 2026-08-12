@@ -241,6 +241,22 @@ static void test_ids(void) {
 
     char tiny[4];
     CHECK(rab_make_binding(tiny, sizeof tiny) == -1, "binding fails on tiny buf");
+
+    char ra[RAB_RECEIPT_MAX];
+    char rb[RAB_RECEIPT_MAX];
+    CHECK(rab_make_receipt(ra, sizeof ra) == 0, "receipt a");
+    CHECK(rab_make_receipt(rb, sizeof rb) == 0, "receipt b");
+    CHECK(strcmp(ra, rb) != 0, "receipts differ (unguessable)");
+    CHECK(strlen(ra) == 32, "receipt is 32 hex chars (128-bit)");
+    int rhex = 1;
+    for (size_t i = 0; i < 32; i++) {
+        char c = ra[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            rhex = 0;
+        }
+    }
+    CHECK(rhex, "receipt is lowercase hex");
+    CHECK(rab_make_receipt(tiny, sizeof tiny) == -1, "receipt fails on tiny buf");
 }
 
 int main(void) {

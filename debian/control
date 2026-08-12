@@ -2,7 +2,7 @@ Source: runix-audit-broker
 Section: admin
 Priority: optional
 Maintainer: Troy Hernandez <troy@cornball.ai>
-Build-Depends: debhelper-compat (= 13), libjansson-dev, pkg-config
+Build-Depends: debhelper-compat (= 13), libjansson-dev, libssl-dev, pkg-config
 Standards-Version: 4.7.0
 Homepage: https://github.com/cornball-ai/runix-audit-broker
 Rules-Requires-Root: no
@@ -14,9 +14,9 @@ Description: privileged audit broker for the Runix durable-audit system
  A small, single-purpose, socket-activated daemon that appends a validated
  audit record to the root-owned Runix system sink on behalf of an
  unprivileged caller. The caller is identified by SO_PEERCRED (never by the
- payload); the broker performs no mutations and exposes only three request
- types (open_intent, write_outcome, emit) over a local AF_UNIX socket, framed
- and parsed strictly.
+ payload); the broker performs no mutations and exposes a small set of request
+ types (open_intent, write_outcome, emit, redeem_receipt, capabilities) over a
+ local AF_UNIX socket, framed and parsed strictly.
  .
  It is the "strong" resolution of the Runix durable-audit authority matrix:
  the component that lets an unprivileged system-scope mutation obtain a
