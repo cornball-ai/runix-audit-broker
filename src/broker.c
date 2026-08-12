@@ -56,6 +56,7 @@ typedef struct intent {
     char rcpt_boot_id[RAB_BOOT_ID_MAX];
     struct intent *hcid;  /* chain in the by-cid table */
     struct intent *hbind; /* chain in the by-binding table */
+    struct intent *hrcpt; /* chain in the by-verifier table (has_receipt only) */
 } intent;
 
 /* Per-uid accounting: a sliding window of recent ops as a FIFO ring of
@@ -83,6 +84,7 @@ struct rab_broker {
     /* open-intent hash tables (share nbkt) */
     intent **bkt_cid;
     intent **bkt_bind;
+    intent **bkt_rcpt; /* by receipt verifier; entries only while has_receipt */
     size_t nbkt;
     size_t open_count;
     /* per-uid accounting hash table */
@@ -337,6 +339,46 @@ static intent *open_find_cid(rab_broker *b, const char *cid) {
     return NULL;
 }
 
+/* by-verifier index over receipt-bearing intents. The verifier is unique per
+ * receipt (the mint-time collision check, plus reconstruction's conflict
+ * rejection), so this maps a token's verifier to at most one intent. It is the
+ * lookup the wire redeem path uses: the request carries the opaque token, the
+ * broker hashes it to a verifier, and finds the receipt here -- no correlation
+ * id ever crosses the wire. Entries live only while an intent has a receipt. */
+static intent *open_find_verifier(rab_broker *b, const char *vhex) {
+    if (vhex[0] == '\0') {
+        return NULL;
+    }
+    for (intent *it = b->bkt_rcpt[hstr(vhex) & (b->nbkt - 1)]; it != NULL;
+         it = it->hrcpt) {
+        if (it->has_receipt && strcmp(it->verifier_hex, vhex) == 0) {
+            return it;
+        }
+    }
+    return NULL;
+}
+
+/* Add an intent to the by-verifier index once its receipt is installed (its
+ * verifier_hex is set). Called right after a receipt is issued live or
+ * reconstructed; never before the durable append that installs the state. */
+static void rcpt_index_add(rab_broker *b, intent *it) {
+    size_t h = hstr(it->verifier_hex) & (b->nbkt - 1);
+    it->hrcpt = b->bkt_rcpt[h];
+    b->bkt_rcpt[h] = it;
+}
+
+/* Remove an intent from the by-verifier index (when it closes). */
+static void rcpt_index_remove(rab_broker *b, intent *it) {
+    intent **pp = &b->bkt_rcpt[hstr(it->verifier_hex) & (b->nbkt - 1)];
+    while (*pp != NULL) {
+        if (*pp == it) {
+            *pp = it->hrcpt;
+            break;
+        }
+        pp = &(*pp)->hrcpt;
+    }
+}
+
 static int open_add(rab_broker *b, const char *cid, const char *binding,
                     const rab_actor *actor, const char *operation,
                     const char *resource, const char *scope) {
@@ -381,6 +423,9 @@ static void open_remove(rab_broker *b, intent *target) {
             break;
         }
         pp = &(*pp)->hbind;
+    }
+    if (target->has_receipt) {
+        rcpt_index_remove(b, target);
     }
     b->open_count--;
     uid_state *u = uid_find(b, target->actor.uid);
@@ -997,6 +1042,75 @@ static int handle_capabilities(char **resp) {
     return reply(resp, rab_response_capabilities());
 }
 
+/* Defined with the receipt-issuance helpers below; also used here to hex-encode
+ * the presented token's verifier for the by-verifier lookup. */
+static void hex_encode(const unsigned char *in, size_t n, char *out);
+
+/* redeem_receipt: the root helper's pre-commit redemption. Token-ADDRESSED --
+ * the request carries the opaque receipt, never a correlation id. The broker
+ * requires the redeeming peer to be uid 0, derives the token's verifier, finds
+ * the receipt by that verifier, redeems via the state primitive (which re-checks
+ * everything in constant time and appends the redeemed transition durably before
+ * this returns), and derives the response correlation id from the matched
+ * intent. The rab_redeem_result maps onto the contract's closed-set receipt
+ * error codes. */
+static int handle_redeem(rab_broker *b, const rab_actor *actor,
+                         const rab_request *req, char **resp) {
+    if (actor->uid != 0) {
+        return reply(resp, rab_response_error(
+                               "receipt_unauthorized",
+                               "the redeeming peer is not the root helper"));
+    }
+    /* the token grammar (32 lc hex) was validated by the parser; derive its
+     * verifier and look the receipt up by that verifier. */
+    unsigned char vraw[RAB_SHA256_LEN];
+    char vhex[RAB_SHA256_HEX_MAX];
+    if (rab_sha256(req->effect_receipt, strlen(req->effect_receipt), vraw) != 0) {
+        return reply(resp, rab_response_error("internal", "digest failure"));
+    }
+    hex_encode(vraw, RAB_SHA256_LEN, vhex);
+    explicit_bzero(vraw, sizeof vraw);
+    intent *it = open_find_verifier(b, vhex);
+    if (it == NULL) {
+        return reply(resp, rab_response_error("receipt_invalid",
+                                              "no such effect receipt"));
+    }
+    /* the correlation id is DERIVED from the matched intent, never client input */
+    rab_redeem_result rr = rab_broker_redeem_receipt(
+        b, it->cid, req->effect_receipt, actor->uid, req->redeem_principal_uid,
+        req->redeem_verb, req->redeem_resource, req->redeem_plan_schema,
+        req->redeem_plan_hash);
+    switch (rr) {
+    case RAB_REDEEM_OK:
+        return reply(resp, rab_response_redeem_ok(it->cid));
+    case RAB_REDEEM_NOT_REDEEMER:
+        return reply(resp, rab_response_error("receipt_unauthorized",
+                                              "the redeeming peer is not uid 0"));
+    case RAB_REDEEM_PRINCIPAL:
+        return reply(resp, rab_response_error(
+                               "receipt_actor_mismatch",
+                               "principal_uid differs from the bound actor"));
+    case RAB_REDEEM_BINDING:
+        return reply(resp, rab_response_error(
+                               "receipt_mismatch",
+                               "verb/resource/plan differ from the bound values"));
+    case RAB_REDEEM_EXPIRED:
+        return reply(resp, rab_response_error(
+                               "receipt_expired", "past its TTL, or the boot id changed"));
+    case RAB_REDEEM_ALREADY:
+        return reply(resp,
+                     rab_response_error("receipt_redeemed", "already redeemed"));
+    case RAB_REDEEM_UNKNOWN:
+    case RAB_REDEEM_TOKEN:
+        return reply(resp, rab_response_error("receipt_invalid",
+                                              "no such effect receipt"));
+    case RAB_REDEEM_PERSIST:
+        return reply(resp, rab_response_error("persist_failed",
+                                              "redemption durability failed"));
+    }
+    return reply(resp, rab_response_error("internal", "unhandled redeem result"));
+}
+
 int rab_broker_handle(rab_broker *b, const rab_actor *actor,
                       const rab_request *req, char **resp) {
     *resp = NULL;
@@ -1016,6 +1130,8 @@ int rab_broker_handle(rab_broker *b, const rab_actor *actor,
         return handle_emit(b, actor, req, resp);
     case RAB_REQ_CAPABILITIES:
         return handle_capabilities(resp);
+    case RAB_REQ_REDEEM:
+        return handle_redeem(b, actor, req, resp);
     }
     return reply(resp, rab_response_error("internal", "unhandled request type"));
 }
@@ -1100,7 +1216,8 @@ static int receipt_bound_eq(const intent *it, const rab_stored *s) {
  * (fail closed); a `redeemed` CHECKPOINT stands alone. Second record: the bound
  * identity must match (a conflicting duplicate fails closed) and the state must
  * be identical (idempotent replay) or a valid issued -> redeemed progression. */
-static const char *apply_receipt(intent *it, const rab_stored *s) {
+static const char *apply_receipt(rab_broker *b, intent *it,
+                                 const rab_stored *s) {
     /* the receipt's bound identity must match its parent intent: a receipt whose
      * actor/verb/resource disagrees with the intent it names is corruption. */
     if (s->rcpt_actor_uid != it->actor.uid ||
@@ -1132,6 +1249,7 @@ static const char *apply_receipt(intent *it, const rab_stored *s) {
                  s->rcpt_plan_hash);
         snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s",
                  s->rcpt_boot_id);
+        rcpt_index_add(b, it); /* verifier now set: index for wire redeem lookup */
         return NULL;
     }
     if (!receipt_bound_eq(it, s)) {
@@ -1216,7 +1334,7 @@ static const char *apply_stored(rab_broker *b, const rab_stored *s,
                        ? "receipt for a closed operation"
                        : "orphan receipt without a matching intent";
         }
-        return apply_receipt(it, s);
+        return apply_receipt(b, it, s);
     }
     /* any other audit phase (e.g. a preview/noop emit) is a standalone closed
      * record: it opens nothing and is not an open/close event. */
@@ -1444,8 +1562,10 @@ rab_broker *rab_broker_open(const char *path, const rab_config *cfg,
     b->nbkt_uid = 1024;
     b->bkt_cid = calloc(b->nbkt, sizeof *b->bkt_cid);
     b->bkt_bind = calloc(b->nbkt, sizeof *b->bkt_bind);
+    b->bkt_rcpt = calloc(b->nbkt, sizeof *b->bkt_rcpt);
     b->bkt_uid = calloc(b->nbkt_uid, sizeof *b->bkt_uid);
-    if (b->bkt_cid == NULL || b->bkt_bind == NULL || b->bkt_uid == NULL) {
+    if (b->bkt_cid == NULL || b->bkt_bind == NULL || b->bkt_rcpt == NULL ||
+        b->bkt_uid == NULL) {
         *err = "out of memory allocating broker tables";
         rab_broker_close(b);
         return NULL;
@@ -1506,6 +1626,7 @@ void rab_broker_close(rab_broker *b) {
     }
     free(b->bkt_cid);
     free(b->bkt_bind);
+    free(b->bkt_rcpt);
     free(b->bkt_uid);
     if (b->fd >= 0) {
         close(b->fd);
@@ -1627,6 +1748,7 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
                  it->resource);
         snprintf(it->rcpt_plan_hash, sizeof it->rcpt_plan_hash, "%s", plan_hash);
         snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s", boot_id);
+        rcpt_index_add(b, it); /* verifier now set: index for wire redeem lookup */
         snprintf(out_token, out_cap, "%s", token);
         rc = 0;
     }

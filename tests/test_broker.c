@@ -1384,6 +1384,138 @@ static void test_receipt_redemption(void) {
 #undef RPH
 #undef WRONG_PH
 
+/* --- 2c/3b: the redeem_receipt WIRE path (verifier-indexed, uid-0 gated) --- */
+#define RPH_W \
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+/* Send a redeem_receipt frame; returns the response code ("OK" on redeem_ok,
+ * else the error code, or "HAS_EXTRA" if redeem_ok wrongly carried a binding or
+ * audit_scope). On OK, copies the returned correlation id into out_cid. */
+static const char *do_redeem(rab_broker *b, const rab_actor *actor,
+                             const char *token, long long principal,
+                             const char *verb, const char *resource,
+                             long long plan_schema, const char *plan_hash,
+                             char *out_cid) {
+    char body[1024];
+    snprintf(body, sizeof body,
+             "{\"type\":\"redeem_receipt\",\"effect_receipt\":\"%s\","
+             "\"principal_uid\":%lld,\"effect\":{\"operation\":\"%s\","
+             "\"resource\":\"%s\",\"plan_schema\":%lld,\"plan_hash\":\"%s\"}}",
+             token, principal, verb, resource, plan_schema, plan_hash);
+    rab_request req;
+    const char *e = NULL;
+    if (rab_parse_request(body, strlen(body), &req, &e) != 0) {
+        return "PARSE_FAIL";
+    }
+    char *resp = NULL;
+    int rc = rab_broker_handle(b, actor, &req, &resp);
+    rab_request_free(&req);
+    if (rc != 0 || resp == NULL) {
+        return "HANDLE_FAIL";
+    }
+    static char code[64];
+    json_error_t je;
+    json_t *r = json_loads(resp, 0, &je);
+    free(resp);
+    if (r == NULL) {
+        return "RESP_PARSE_FAIL";
+    }
+    const char *ret = "OK";
+    if (json_is_true(json_object_get(r, "ok"))) {
+        json_t *jc = json_object_get(r, "correlation_id");
+        if (out_cid != NULL && json_is_string(jc)) {
+            snprintf(out_cid, RAB_CID_MAX, "%s", json_string_value(jc));
+        }
+        if (json_object_get(r, "binding") != NULL ||
+            json_object_get(r, "audit_scope") != NULL) {
+            ret = "HAS_EXTRA"; /* redeem_ok is a correlation id only */
+        }
+    } else {
+        json_t *err = json_object_get(r, "error");
+        snprintf(code, sizeof code, "%s",
+                 json_is_string(err) ? json_string_value(err) : "?");
+        ret = code;
+    }
+    json_decref(r);
+    return ret;
+}
+
+static void test_redeem_wire(void) {
+    char dir[256], path[512];
+    const char *err = NULL;
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    rab_actor root = mk_actor(0, 99, "boot-abc", "111"); /* the pkexec'd helper */
+    rt_mut clk;
+
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    clk.now_us = 1000000ull;
+    snprintf(clk.boot, sizeof clk.boot, "boot-live");
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (redeem wire)");
+    rab_broker_test_set_receipt_time(b, rt_mut_boottime, rt_mut_bootid, &clk);
+
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX];
+    char tok[RAB_RECEIPT_MAX] = {0};
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0, "open intent (redeem wire)");
+    CHECK(rab_broker_issue_receipt(b, cid, 1, RPH_W, tok, sizeof tok) == 0,
+          "issue receipt (redeem wire)");
+
+    /* a non-root redeemer is refused before any verifier lookup */
+    CHECK(strcmp(do_redeem(b, &a, tok, 1000, "svc.restart", "", 1, RPH_W, NULL),
+                 "receipt_unauthorized") == 0, "non-root redeemer refused");
+    /* a well-formed token that matches no verifier -> receipt_invalid */
+    CHECK(strcmp(do_redeem(b, &root, "ffffffffffffffffffffffffffffffff", 1000,
+                           "svc.restart", "", 1, RPH_W, NULL),
+                 "receipt_invalid") == 0, "unknown token refused");
+    /* principal mismatch -> receipt_actor_mismatch */
+    CHECK(strcmp(do_redeem(b, &root, tok, 1001, "svc.restart", "", 1, RPH_W, NULL),
+                 "receipt_actor_mismatch") == 0, "principal mismatch refused");
+    /* wrong verb -> receipt_mismatch */
+    CHECK(strcmp(do_redeem(b, &root, tok, 1000, "svc.stop", "", 1, RPH_W, NULL),
+                 "receipt_mismatch") == 0, "plan mismatch refused");
+
+    /* happy path: correct everything -> redeem_ok; the cid is DERIVED from the
+     * matched intent, and the response carries no binding/audit_scope */
+    char rcid[RAB_CID_MAX] = {0};
+    CHECK(strcmp(do_redeem(b, &root, tok, 1000, "svc.restart", "", 1, RPH_W, rcid),
+                 "OK") == 0, "wire redemption succeeds");
+    CHECK(strcmp(rcid, cid) == 0, "redeem_ok correlation id derived from the intent");
+    CHECK(rab_broker_receipt_state(b, cid) == 1, "receipt redeemed via the wire");
+    /* single use: a second wire redeem -> receipt_redeemed */
+    CHECK(strcmp(do_redeem(b, &root, tok, 1000, "svc.restart", "", 1, RPH_W, NULL),
+                 "receipt_redeemed") == 0, "second wire redeem refused");
+    /* the effect outcome is now accepted: the gate is satisfied by redemption */
+    CHECK(strcmp(do_outcome_ei(b, &a, bind, 1), "OK") == 0,
+          "effect outcome accepted after wire redemption");
+    /* the intent closed, so its verifier is no longer redeemable */
+    CHECK(strcmp(do_redeem(b, &root, tok, 1000, "svc.restart", "", 1, RPH_W, NULL),
+                 "receipt_invalid") == 0, "a closed intent's receipt is gone");
+    rab_broker_close(b);
+    cleanup_dir(dir);
+
+    /* TTL expiry over the wire */
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    clk.now_us = 1000000ull;
+    snprintf(clk.boot, sizeof clk.boot, "boot-live");
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (redeem wire expiry)");
+    rab_broker_test_set_receipt_time(b, rt_mut_boottime, rt_mut_bootid, &clk);
+    char tok2[RAB_RECEIPT_MAX] = {0};
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0, "open (expiry)");
+    CHECK(rab_broker_issue_receipt(b, cid, 1, RPH_W, tok2, sizeof tok2) == 0,
+          "issue (expiry)");
+    clk.now_us = 1000000ull + 300ull * 1000000ull + 1ull;
+    CHECK(strcmp(do_redeem(b, &root, tok2, 1000, "svc.restart", "", 1, RPH_W, NULL),
+                 "receipt_expired") == 0, "expired receipt refused via the wire");
+    rab_broker_close(b);
+    cleanup_dir(dir);
+}
+#undef RPH_W
+
 static void test_strict_parsing(void) {
     /* a well-formed intent record (baseline: must parse) */
     const char *ok =
@@ -2695,6 +2827,7 @@ int main(void) {
     test_receipt_reconstruction_conflicts();
     test_receipt_redeemed_rotation();
     test_receipt_redemption();
+    test_redeem_wire();
     test_cross_sink_schema();
     test_strict_parsing();
     test_lifecycle_and_reconstruction();

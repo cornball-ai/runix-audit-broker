@@ -195,6 +195,89 @@ int main(void) {
     CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
                        "\"outcome\":\"intent\"},\"effect\":5}"),
                  "schema_invalid") == 0, "effect not an object rejected");
+
+    /* --- redeem_receipt: token grammar validated before the broker hashes it,
+     * plus the presented-plan effect object --- */
+#define TOK32 "0123456789abcdef0123456789abcdef"
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":1000,\"effect\":{\"operation\":"
+                       "\"apt.install\",\"resource\":\"nginx\",\"plan_schema\":1,"
+                       "\"plan_hash\":\"" HEX64 "\"}}"), "OK") == 0,
+          "valid redeem_receipt");
+    {
+        rab_request req;
+        const char *err = NULL;
+        const char *b = "{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                        "\",\"principal_uid\":1000,\"effect\":{\"operation\":"
+                        "\"apt.install\",\"resource\":\"nginx\",\"plan_schema\":3,"
+                        "\"plan_hash\":\"" HEX64 "\"}}";
+        CHECK(rab_parse_request(b, strlen(b), &req, &err) == 0, "parse redeem");
+        CHECK(req.type == RAB_REQ_REDEEM, "redeem type");
+        CHECK(strcmp(req.effect_receipt, TOK32) == 0, "token extracted");
+        CHECK(req.redeem_principal_uid == 1000, "principal extracted");
+        CHECK(strcmp(req.redeem_verb, "apt.install") == 0, "verb extracted");
+        CHECK(strcmp(req.redeem_resource, "nginx") == 0, "resource extracted");
+        CHECK(req.redeem_plan_schema == 3, "redeem plan_schema extracted");
+        CHECK(strcmp(req.redeem_plan_hash, HEX64) == 0, "redeem plan_hash extracted");
+        rab_request_free(&req);
+    }
+    /* token grammar: exactly 32 lowercase hex */
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":"
+                       "\"0123456789abcdef0123456789abcde\",\"principal_uid\":1,"
+                       "\"effect\":{\"operation\":\"x\",\"resource\":\"y\","
+                       "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "redeem short token rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "ab\",\"principal_uid\":1,\"effect\":{\"operation\":\"x\","
+                       "\"resource\":\"y\",\"plan_schema\":1,\"plan_hash\":\""
+                       HEX64 "\"}}"), "schema_invalid") == 0,
+          "redeem long token rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":"
+                       "\"0123456789ABCDEF0123456789abcdef\",\"principal_uid\":1,"
+                       "\"effect\":{\"operation\":\"x\",\"resource\":\"y\","
+                       "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "redeem uppercase token rejected");
+    /* principal_uid: a non-negative JSON integer */
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":-1,\"effect\":{\"operation\":\"x\","
+                       "\"resource\":\"y\",\"plan_schema\":1,\"plan_hash\":\""
+                       HEX64 "\"}}"), "schema_invalid") == 0,
+          "redeem negative principal rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":1.5,\"effect\":{\"operation\":\"x\","
+                       "\"resource\":\"y\",\"plan_schema\":1,\"plan_hash\":\""
+                       HEX64 "\"}}"), "schema_invalid") == 0,
+          "redeem real principal rejected");
+    /* redeem effect grammar: exact keys, plan_schema >= 1, plan_hash 64 lc hex */
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":1,\"effect\":{\"operation\":\"x\","
+                       "\"resource\":\"y\",\"plan_schema\":0,\"plan_hash\":\""
+                       HEX64 "\"}}"), "schema_invalid") == 0,
+          "redeem plan_schema 0 rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":1,\"effect\":{\"operation\":\"x\","
+                       "\"resource\":\"y\",\"plan_schema\":1,\"plan_hash\":"
+                       "\"short\"}}"), "schema_invalid") == 0,
+          "redeem short plan_hash rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":1,\"effect\":{\"operation\":\"x\","
+                       "\"resource\":\"y\",\"plan_schema\":1,\"plan_hash\":\""
+                       HEX64 "\",\"z\":1}}"), "schema_invalid") == 0,
+          "redeem effect extra key rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":1,\"effect\":{\"operation\":\"x\","
+                       "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "redeem effect missing resource rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":1,\"effect\":{\"operation\":\"x\","
+                       "\"resource\":\"y\",\"plan_schema\":1,\"plan_hash\":\""
+                       HEX64 "\"},\"extra\":1}"), "schema_invalid") == 0,
+          "redeem extra top-level key rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"principal_uid\":1,"
+                       "\"effect\":{\"operation\":\"x\",\"resource\":\"y\","
+                       "\"plan_schema\":1,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "redeem missing token rejected");
+#undef TOK32
 #undef HEX64
 
     /* --- duplicate keys rejected (JSON_REJECT_DUPLICATES) --- */

@@ -11,16 +11,20 @@
 
 #include <jansson.h>
 #include <stddef.h>
+#include <sys/types.h> /* uid_t */
 
 #define RAB_MAX_DEPTH 8       /* records are shallow: object > record > observed */
 #define RAB_BINDING_STR_MAX 128
 #define RAB_PLAN_HASH_MAX 65  /* 64-hex SHA-256 plan digest + NUL */
+#define RAB_RECEIPT_TOKEN_MAX 33 /* 32-hex receipt token (128-bit) + NUL */
+#define RAB_REDEEM_STR_MAX 128   /* redeem effect verb/resource bound */
 
 typedef enum {
     RAB_REQ_OPEN_INTENT,
     RAB_REQ_WRITE_OUTCOME,
     RAB_REQ_EMIT,
-    RAB_REQ_CAPABILITIES
+    RAB_REQ_CAPABILITIES,
+    RAB_REQ_REDEEM
 } rab_req_type;
 
 typedef struct {
@@ -35,6 +39,15 @@ typedef struct {
     int effect_present;
     json_int_t effect_plan_schema;            /* effect.plan_schema (>= 1) */
     char effect_plan_hash[RAB_PLAN_HASH_MAX]; /* effect.plan_hash (64 lc hex) */
+    /* redeem_receipt request. The opaque token's grammar (exactly 32 lowercase
+     * hex) is validated HERE, before the broker ever hashes it; the plan the
+     * helper's atomic resolve produced is presented for the bound-plan match. */
+    char effect_receipt[RAB_RECEIPT_TOKEN_MAX]; /* the opaque 32-hex token */
+    uid_t redeem_principal_uid;                 /* PKEXEC_UID (bound-actor check) */
+    char redeem_verb[RAB_REDEEM_STR_MAX];       /* redeem effect.operation */
+    char redeem_resource[RAB_REDEEM_STR_MAX];   /* redeem effect.resource */
+    json_int_t redeem_plan_schema;              /* redeem effect.plan_schema */
+    char redeem_plan_hash[RAB_PLAN_HASH_MAX];   /* redeem effect.plan_hash */
     json_t *record;                    /* borrowed from root */
     json_t *root;                      /* owned; free via rab_request_free */
 } rab_request;
