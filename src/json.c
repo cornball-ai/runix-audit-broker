@@ -321,7 +321,7 @@ static char *dump_compact(json_t *obj) {
 }
 
 char *rab_response_open_ok(const char *correlation_id, const char *binding,
-                           const char *audit_scope) {
+                           const char *audit_scope, const char *effect_receipt) {
     json_t *o = json_object();
     if (o == NULL) {
         return NULL;
@@ -329,8 +329,24 @@ char *rab_response_open_ok(const char *correlation_id, const char *binding,
     json_object_set_new(o, "ok", json_true());
     json_object_set_new(o, "correlation_id", json_string(correlation_id));
     json_object_set_new(o, "binding", json_string(binding));
+    /* a receipt-bearing open carries the opaque effect receipt; JSON_SORT_KEYS
+     * places it in canonical position. Omitted entirely for an ordinary open. */
+    if (effect_receipt != NULL) {
+        json_object_set_new(o, "effect_receipt", json_string(effect_receipt));
+    }
     json_object_set_new(o, "persisted", json_true());
     json_object_set_new(o, "audit_scope", json_string(audit_scope));
+    return dump_compact(o);
+}
+
+char *rab_response_redeem_ok(const char *correlation_id) {
+    json_t *o = json_object();
+    if (o == NULL) {
+        return NULL;
+    }
+    json_object_set_new(o, "ok", json_true());
+    json_object_set_new(o, "correlation_id", json_string(correlation_id));
+    json_object_set_new(o, "persisted", json_true());
     return dump_compact(o);
 }
 

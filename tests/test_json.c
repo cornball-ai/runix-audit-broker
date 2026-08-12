@@ -267,11 +267,24 @@ int main(void) {
 
     /* --- golden response bytes (JSON_COMPACT | JSON_SORT_KEYS) --- */
     {
-        char *r = rab_response_open_ok("cid1", "bind1", "system");
+        char *r = rab_response_open_ok("cid1", "bind1", "system", NULL);
         CHECK(r != NULL && strcmp(r,
             "{\"audit_scope\":\"system\",\"binding\":\"bind1\","
             "\"correlation_id\":\"cid1\",\"ok\":true,\"persisted\":true}")
             == 0, "open_ok golden bytes");
+        free(r);
+        /* a receipt-bearing open_ok inserts effect_receipt in sorted position */
+        r = rab_response_open_ok("cid1", "bind1", "system", "rcpt1");
+        CHECK(r != NULL && strcmp(r,
+            "{\"audit_scope\":\"system\",\"binding\":\"bind1\","
+            "\"correlation_id\":\"cid1\",\"effect_receipt\":\"rcpt1\","
+            "\"ok\":true,\"persisted\":true}")
+            == 0, "open_ok_effect golden bytes");
+        free(r);
+        r = rab_response_redeem_ok("cid1");
+        CHECK(r != NULL && strcmp(r,
+            "{\"correlation_id\":\"cid1\",\"ok\":true,\"persisted\":true}")
+            == 0, "redeem_ok golden bytes");
         free(r);
         r = rab_response_outcome_ok();
         CHECK(r != NULL && strcmp(r, "{\"ok\":true,\"persisted\":true}") == 0,

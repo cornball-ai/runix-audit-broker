@@ -54,9 +54,15 @@ int rab_json_depth(const json_t *v);
 
 /* Canonical (compact, sorted-key) response builders. Each returns a malloc'd
  * NUL-terminated string (caller frees) or NULL on allocation failure. */
+/* open_intent success. `effect_receipt` is the opaque receipt token when the
+ * open issued one (a receipt-bearing open_ok), or NULL to omit the member (an
+ * ordinary open_ok). The receipt is a distinct token from `binding`; the caller
+ * guarantees they differ via the mint-time collision check. */
 char *rab_response_open_ok(const char *correlation_id, const char *binding,
-                           const char *audit_scope);
+                           const char *audit_scope, const char *effect_receipt);
 char *rab_response_outcome_ok(void);
+/* redeem_receipt success: a correlation id only (no binding, no audit_scope). */
+char *rab_response_redeem_ok(const char *correlation_id);
 /* emit success: a minted correlation id and no binding (opens no intent). */
 char *rab_response_emit_ok(const char *correlation_id, const char *audit_scope);
 /* capability negotiation: what this broker supports. `extensions` is empty and

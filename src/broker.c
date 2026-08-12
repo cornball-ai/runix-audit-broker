@@ -874,7 +874,7 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
                                "persist_failed",
                                "audit durability uncertain after rotation"));
     }
-    return reply(resp, rab_response_open_ok(cid, binding, "system"));
+    return reply(resp, rab_response_open_ok(cid, binding, "system", NULL));
 }
 
 static int handle_outcome(rab_broker *b, const rab_actor *actor,
