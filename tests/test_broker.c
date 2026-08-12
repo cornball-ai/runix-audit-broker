@@ -756,6 +756,35 @@ static int count_receipt_records(const char *path, const char *cid) {
     return n;
 }
 
+/* The accepted_time_us of the last broker_receipt record for `cid` in the
+ * current segment, or 0 if none (parsed via rab_parse_stored). */
+static unsigned long long receipt_accepted_time(const char *path,
+                                                const char *cid) {
+    FILE *f = fopen(path, "r");
+    unsigned long long t = 0;
+    if (f != NULL) {
+        char ln[8192];
+        while (fgets(ln, sizeof ln, f)) {
+            if (strstr(ln, "broker_receipt") == NULL ||
+                strstr(ln, cid) == NULL) {
+                continue;
+            }
+            size_t len = strlen(ln);
+            if (len > 0 && ln[len - 1] == '\n') {
+                ln[--len] = '\0';
+            }
+            rab_stored s;
+            if (rab_parse_stored(ln, len, &s) == 0 &&
+                s.type == RAB_REC_RECEIPT) {
+                t = s.rcpt_accepted_time_us;
+            }
+            rab_stored_free(&s);
+        }
+        fclose(f);
+    }
+    return t;
+}
+
 /* Injectable receipt-time providers for the failure tests. */
 static int rt_ok_boottime(void *ctx, unsigned long long *out) {
     (void) ctx;
@@ -968,6 +997,21 @@ static void test_receipt_reconstruction_conflicts(void) {
         free(r1);
         free(r2);
     }
+    /* same-state duplicate, identical binding, but a DIFFERENT accept time is a
+     * conflicting (non-idempotent) duplicate, not an idempotent replay */
+    {
+        char *r1 = rab_build_receipt("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, 1000,
+                                     "apt.install", "nginx", 1, RS_PH, 111ull,
+                                     222ull, "boot-broker", 333ull);
+        char *r2 = rab_build_receipt("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, 1000,
+                                     "apt.install", "nginx", 1, RS_PH, 111ull,
+                                     222ull, "boot-broker", 999ull);
+        char *ls[] = {audit, r1, r2};
+        CHECK(recon_segment(ls, 3, "cid-x", NULL) == 0,
+              "same-state duplicate with a different accept time fails closed");
+        free(r1);
+        free(r2);
+    }
     /* a redeemed TRANSITION with no prior issued -> fail closed */
     {
         char *r1 = mk_rcpt_line("cid-x", RAB_RCPT_REDEEMED, 0, RS_V1,
@@ -1096,8 +1140,14 @@ static void test_receipt_redeemed_rotation(void) {
     tmpdir(dir, sizeof dir);
     sink_path(dir, path, sizeof path);
     char *l0 = mk_intent_line("cid-red", "bindred", &a);
-    char *l1 = mk_rcpt_line("cid-red", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
-    char *l2 = mk_rcpt_line("cid-red", RAB_RCPT_REDEEMED, 0, RS_V1, "apt.install");
+    /* distinct accept times: issued at 100, redeemed at 200, so the surviving
+     * checkpoint must carry 200 (the redemption), not the earlier issue. */
+    char *l1 = rab_build_receipt("cid-red", RAB_RCPT_ISSUED, 0, RS_V1, 1000,
+                                 "apt.install", "nginx", 1, RS_PH, 111ull, 222ull,
+                                 "boot-broker", 100ull);
+    char *l2 = rab_build_receipt("cid-red", RAB_RCPT_REDEEMED, 0, RS_V1, 1000,
+                                 "apt.install", "nginx", 1, RS_PH, 111ull, 222ull,
+                                 "boot-broker", 200ull);
     char *seed[] = {l0, l1, l2};
     write_segment(path, seed, 3);
     free(l0);
@@ -1124,6 +1174,8 @@ static void test_receipt_redeemed_rotation(void) {
           "redeemed receipt reconstructs after rotation+restart");
     CHECK(count_receipt_records(path, "cid-red") == 1,
           "exactly one redeemed checkpoint survives");
+    CHECK(receipt_accepted_time(path, "cid-red") == 200ull,
+          "the surviving checkpoint carries the redeemed transition's accept time");
     rab_broker_close(b);
     cleanup_dir(dir);
 
@@ -2485,6 +2537,47 @@ static void test_receipt_accounting(void) {
               "the redeemed append is refused on the bound actor's op quota");
         CHECK(rab_broker_receipt_state(b, cid) == 0,
               "the receipt stays issued when the redeemed append is refused");
+        rab_broker_close(b);
+        cleanup_dir(dir);
+    }
+
+    /* (3b) redemption BYTE-quota refusal: size the per-uid byte quota to admit
+     * the effect open (intent + issued receipt) exactly, so the further byte
+     * write -- the redeemed transition -- is refused. Measured with the same
+     * injected receipt sources so the sizes match byte-for-byte. */
+    {
+        rab_config cfg;
+        rab_config_defaults(&cfg);
+        rab_actor root = mk_actor(0, 99, "boot-abc", "111");
+        rt_mut clk;
+        clk.now_us = 1000000ull;
+        snprintf(clk.boot, sizeof clk.boot, "boot-live");
+        unsigned long long osz;
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_broker *m = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(m != NULL, "broker open (measure redeem bytes)");
+        rab_broker_test_set_receipt_time(m, rt_mut_boottime, rt_mut_bootid, &clk);
+        CHECK(strcmp(do_open_effect(m, &a, 1, ACC_PH, bind, cid, rcpt), "OK") == 0,
+              "measure effect open (redeem bytes)");
+        osz = (unsigned long long) file_size(path);
+        rab_broker_close(m);
+        cleanup_dir(dir);
+
+        cfg.rate_max_bytes_per_uid = osz; /* admits the open exactly, no more */
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "broker open (redeem byte refusal)");
+        rab_broker_test_set_receipt_time(b, rt_mut_boottime, rt_mut_bootid, &clk);
+        CHECK(strcmp(do_open_effect(b, &a, 1, ACC_PH, bind, cid, rcpt), "OK") == 0,
+              "effect open fits the byte quota exactly");
+        CHECK(strcmp(do_redeem(b, &root, rcpt, 1000, "apt.install", "nginx", 1,
+                               ACC_PH, NULL),
+                     "rate_limited") == 0,
+              "the redeemed append is refused on the bound actor's byte quota");
+        CHECK(rab_broker_receipt_state(b, cid) == 0,
+              "the receipt stays issued (redeem byte-refused)");
         rab_broker_close(b);
         cleanup_dir(dir);
     }

@@ -1305,10 +1305,20 @@ static const char *apply_receipt(rab_broker *b, intent *it,
         return "conflicting duplicate receipt";
     }
     if (s->rcpt_state == it->rcpt_state) {
+        /* A genuine idempotent replay is byte-identical, including this
+         * transition's accept time (accepted_time_us is per-transition, not part
+         * of the bound identity). A same-state record with a different accept
+         * time is a conflicting duplicate, not an idempotent replay. */
+        if (s->rcpt_accepted_time_us != it->rcpt_accepted_time_us) {
+            return "conflicting duplicate receipt";
+        }
         return NULL; /* idempotent replay */
     }
     if (it->rcpt_state == RAB_RCPT_ISSUED && s->rcpt_state == RAB_RCPT_REDEEMED) {
         it->rcpt_state = RAB_RCPT_REDEEMED;
+        /* adopt the redeemed transition's accept time, so a later rotation
+         * checkpoint reflects the redemption rather than the earlier issue. */
+        it->rcpt_accepted_time_us = s->rcpt_accepted_time_us;
         return NULL;
     }
     return "inconsistent receipt state transition";
