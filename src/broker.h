@@ -69,6 +69,11 @@ void rab_broker_close(rab_broker *b);
 int rab_broker_handle(rab_broker *b, const rab_actor *actor,
                       const rab_request *req, char **resp);
 
+/* rab_broker_issue_receipt return: 0 success; RAB_ISSUE_RATE_LIMITED when the
+ * receipt append would exceed the opener's per-uid op/byte quota (nothing is
+ * written); -1 for any other failure. */
+#define RAB_ISSUE_RATE_LIMITED (-2)
+
 /* Issue an effect receipt bound to an already-open intent (by correlation_id):
  * mint a 128-bit token, persist an `issued` broker_receipt record durably
  * (fsync), THEN install the receipt state on the intent (never before the
@@ -99,6 +104,7 @@ typedef enum {
     RAB_REDEEM_BINDING,      /* verb/resource/plan_schema/plan_hash disagree */
     RAB_REDEEM_EXPIRED,      /* the TTL elapsed, or a reboot invalidated it */
     RAB_REDEEM_ALREADY,      /* already redeemed (single-use) */
+    RAB_REDEEM_RATE,         /* the redeemed append would exceed the bound actor's quota */
     RAB_REDEEM_PERSIST       /* poisoned, no free space, or a durable-append fault */
 } rab_redeem_result;
 

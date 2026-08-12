@@ -216,7 +216,8 @@ char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
                         const char *verb, const char *resource,
                         long long plan_schema, const char *plan_hash,
                         unsigned long long issue_boottime_us,
-                        unsigned long long ttl_us, const char *boot_id) {
+                        unsigned long long ttl_us, const char *boot_id,
+                        unsigned long long accepted_time_us) {
     /* Fail closed on any input the strict parser would later reject, and never
      * silently coerce an unknown state to "issued": the builder is as strict as
      * rab_parse_stored, so a bad receipt is never written in the first place. */
@@ -236,8 +237,10 @@ char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
     }
     char ibt[24];
     char ttl[24];
+    char ats[24];
     snprintf(ibt, sizeof ibt, "%llu", issue_boottime_us);
     snprintf(ttl, sizeof ttl, "%llu", ttl_us);
+    snprintf(ats, sizeof ats, "%llu", accepted_time_us);
     int bad = 0;
     bad |= json_object_set_new(root, "schema_version",
                                json_integer(RAB_RECORD_SCHEMA_VERSION));
@@ -263,6 +266,7 @@ char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
     bad |= json_object_set_new(root, "issue_boottime_us", json_string(ibt));
     bad |= json_object_set_new(root, "ttl_us", json_string(ttl));
     bad |= json_object_set_new(root, "boot_id", json_string(boot_id));
+    bad |= json_object_set_new(root, "accepted_time_us", json_string(ats));
     if (bad) {
         json_decref(root);
         return NULL;
@@ -469,12 +473,13 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
          * carries only the SHA-256 verifier, never the token. Validated exactly
          * and in full here; any missing/extra/malformed field fails closed. */
         static const char *const rk[] = {
-            "schema_version",   "record_type",  "state_schema_version",
-            "correlation_id",   "checkpoint",   "state",
-            "verifier",         "actor_uid",    "verb",
-            "resource",         "plan_schema",  "plan_hash",
-            "issue_boottime_us", "ttl_us",      "boot_id"};
-        if (!obj_only_keys(root, rk, 15)) {
+            "schema_version",    "record_type", "state_schema_version",
+            "correlation_id",    "checkpoint",  "state",
+            "verifier",          "actor_uid",   "verb",
+            "resource",          "plan_schema", "plan_hash",
+            "issue_boottime_us", "ttl_us",      "boot_id",
+            "accepted_time_us"};
+        if (!obj_only_keys(root, rk, 16)) {
             goto done;
         }
         json_t *ssv = json_object_get(root, "state_schema_version");
@@ -559,6 +564,12 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
         if (!json_is_string(jboot) || json_string_value(jboot)[0] == '\0' ||
             copy_bounded(out->rcpt_boot_id, sizeof out->rcpt_boot_id,
                          json_string_value(jboot)) != 0) {
+            goto done;
+        }
+        json_t *jats = json_object_get(root, "accepted_time_us");
+        if (!json_is_string(jats) ||
+            parse_u64_strict(json_string_value(jats),
+                             &out->rcpt_accepted_time_us) != 0) {
             goto done;
         }
         out->type = RAB_REC_RECEIPT;

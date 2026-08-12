@@ -89,7 +89,8 @@ char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
                         const char *verb, const char *resource,
                         long long plan_schema, const char *plan_hash,
                         unsigned long long issue_boottime_us,
-                        unsigned long long ttl_us, const char *boot_id);
+                        unsigned long long ttl_us, const char *boot_id,
+                        unsigned long long accepted_time_us);
 
 typedef enum {
     RAB_REC_AUDIT,
@@ -128,6 +129,10 @@ typedef struct {
     unsigned long long rcpt_issue_boottime_us;
     unsigned long long rcpt_ttl_us;
     char rcpt_boot_id[RAB_BOOT_ID_MAX];
+    /* broker-assigned wall-clock accept time of THIS receipt append, for
+     * reconstructing its per-uid rate/byte charge on a plain restart (parallel
+     * to an audit record's accepted_time_us). */
+    unsigned long long rcpt_accepted_time_us;
 } rab_stored;
 
 /* Parse one stored line into *out. Returns 0 on a well-formed broker record,

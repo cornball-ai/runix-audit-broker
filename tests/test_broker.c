@@ -484,7 +484,7 @@ static int parses_ok(const char *s) {
     "false,\"state\":\"" state "\",\"verifier\":\"" ver "\",\"actor_uid\":"    \
     uid ",\"verb\":\"apt.install\",\"resource\":\"nginx\",\"plan_schema\":" ps \
     ",\"plan_hash\":\"" ph "\",\"issue_boottime_us\":\"" ibt "\",\"ttl_us\":" \
-    "\"" ttl "\",\"boot_id\":\"b\"}"
+    "\"" ttl "\",\"boot_id\":\"b\",\"accepted_time_us\":\"7\"}"
 
 /* lowercase-hex encode n bytes into out (2n+1 chars including NUL). */
 static void rcpt_hex(const unsigned char *in, size_t n, char *out) {
@@ -511,7 +511,7 @@ static void test_receipt_record(void) {
         rcpt_hex(vraw, RAB_SHA256_LEN, vhex);
         char *g = rab_build_receipt("cid-g1", RAB_RCPT_ISSUED, 0, vhex, 1000,
                                     "apt.install", "nginx", 1, RCPT_HX, 1ull,
-                                    2ull, "b");
+                                    2ull, "b", 3ull);
         CHECK(g != NULL, "receipt built with a real verifier");
         if (g != NULL) {
             CHECK(strstr(g, tok) == NULL, "the live receipt token is absent");
@@ -522,7 +522,7 @@ static void test_receipt_record(void) {
 
     char *line = rab_build_receipt("cid-r1", RAB_RCPT_ISSUED, 0, RCPT_HX, 1000,
                                    "apt.install", "nginx", 1, RCPT_HX, 500000ull,
-                                   30000000ull, "boot-xyz");
+                                   30000000ull, "boot-xyz", 42ull);
     CHECK(line != NULL, "receipt record built");
     if (line != NULL) {
         rab_stored s;
@@ -540,12 +540,13 @@ static void test_receipt_record(void) {
         CHECK(s.rcpt_issue_boottime_us == 500000ull, "issue boottime round-trips");
         CHECK(s.rcpt_ttl_us == 30000000ull, "ttl round-trips");
         CHECK(strcmp(s.rcpt_boot_id, "boot-xyz") == 0, "boot_id round-trips");
+        CHECK(s.rcpt_accepted_time_us == 42ull, "accepted_time_us round-trips");
         rab_stored_free(&s);
         free(line);
     }
     /* a redeemed receipt with an empty resource round-trips its state too */
     line = rab_build_receipt("cid-r2", RAB_RCPT_REDEEMED, 1, RCPT_HX, 0,
-                             "apt.update", "", 2, RCPT_HX, 1ull, 2ull, "b");
+                             "apt.update", "", 2, RCPT_HX, 1ull, 2ull, "b", 7ull);
     CHECK(line != NULL, "redeemed receipt built");
     if (line != NULL) {
         rab_stored s;
@@ -633,22 +634,22 @@ static void test_receipt_record(void) {
     /* the builder is itself fail-closed: it never emits a record the parser
      * would reject, and never silently coerces an unknown state to "issued". */
     CHECK(rab_build_receipt("c", (rab_rcpt_state) 7, 0, RCPT_HX, 1, "v", "r", 1,
-                            RCPT_HX, 1, 2, "b") == NULL,
+                            RCPT_HX, 1, 2, "b", 1) == NULL,
           "builder rejects an unknown state");
     CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, 0, "nothex", 1, "v", "r", 1,
-                            RCPT_HX, 1, 2, "b") == NULL,
+                            RCPT_HX, 1, 2, "b", 1) == NULL,
           "builder rejects a malformed verifier");
     CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, 0, RCPT_HX, 1, "v", "r", 1,
-                            "nothex", 1, 2, "b") == NULL,
+                            "nothex", 1, 2, "b", 1) == NULL,
           "builder rejects a malformed plan_hash");
     CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, 0, RCPT_HX, 1, "v", "r", 0,
-                            RCPT_HX, 1, 2, "b") == NULL,
+                            RCPT_HX, 1, 2, "b", 1) == NULL,
           "builder rejects plan_schema 0");
     CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, 0, RCPT_HX, 1, "", "r", 1,
-                            RCPT_HX, 1, 2, "b") == NULL,
+                            RCPT_HX, 1, 2, "b", 1) == NULL,
           "builder rejects an empty verb");
     CHECK(rab_build_receipt("", RAB_RCPT_ISSUED, 0, RCPT_HX, 1, "v", "r", 1,
-                            RCPT_HX, 1, 2, "b") == NULL,
+                            RCPT_HX, 1, 2, "b", 1) == NULL,
           "builder rejects an empty correlation_id");
 }
 #undef RCPT
@@ -705,7 +706,7 @@ static char *mk_rcpt_full(const char *cid, rab_rcpt_state st, int ckpt,
                           const char *verifier, uid_t uid, const char *verb,
                           const char *resource) {
     return rab_build_receipt(cid, st, ckpt, verifier, uid, verb, resource, 1,
-                             RS_PH, 111ull, 222ull, "boot-broker");
+                             RS_PH, 111ull, 222ull, "boot-broker", 333ull);
 }
 
 /* The common case: bound to uid 1000, verb "apt.install", resource "nginx". */
@@ -2385,36 +2386,135 @@ static void test_effect_open_wire(void) {
     cleanup_dir(dir);
 }
 
-/* 3c fix: the issued broker_receipt append is a real durable write, counted in
- * the opener's per-uid op window -- an effect open consumes TWO op slots (the
- * intent and its receipt), not one, and the accounting is under the opener. */
+/* 3c fixes: receipt appends are real durable writes -- quota-CHECKED before the
+ * append (op-count and bytes, on both issue and redeem), accounted under the
+ * bound original actor, and reconstructed on a plain restart (no rotation). */
+#define ACC_PH \
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 static void test_receipt_accounting(void) {
     char dir[256], path[512];
     const char *err = NULL;
-    rab_config cfg;
-    rab_config_defaults(&cfg);
-    cfg.rate_max_in_window = 2; /* the window holds exactly intent + its receipt */
     rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
-    tmpdir(dir, sizeof dir);
-    sink_path(dir, path, sizeof path);
-    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
-    CHECK(b != NULL, "broker open (receipt accounting)");
     char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX], rcpt[RAB_RECEIPT_MAX];
-    CHECK(strcmp(do_open_effect(
-                     b, &a, 1,
-                     "0123456789abcdef0123456789abcdef0123456789abcdef"
-                     "0123456789abcdef",
-                     bind, cid, rcpt),
-                 "OK") == 0,
-          "effect open (accounting)");
-    CHECK(strlen(rcpt) == 32, "receipt issued (accounting)");
-    /* both the intent and its receipt landed in the op window (2/2), so the next
-     * op is rate-limited -- proof the receipt append was accounted. */
-    CHECK(strcmp(do_emit(b, &a, "preview", NULL), "rate_limited") == 0,
-          "the receipt append counts against the per-uid op window");
-    rab_broker_close(b);
-    cleanup_dir(dir);
+
+    /* (1) op-count refusal BEFORE the receipt append: with a 1-op window the
+     * intent takes the only slot, so the receipt append is refused up front and
+     * the effect open returns rate_limited -- the intent stays a durable
+     * open-no-receipt record. */
+    {
+        rab_config cfg;
+        rab_config_defaults(&cfg);
+        cfg.rate_max_in_window = 1;
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "broker open (issue op refusal)");
+        CHECK(strcmp(do_open_effect(b, &a, 1, ACC_PH, bind, cid, rcpt),
+                     "rate_limited") == 0,
+              "receipt append refused up front on op-count");
+        CHECK(rab_broker_open_count(b) == 1, "the intent stayed durably open");
+        CHECK(rab_broker_receipt_state(b, cid) == -1, "no receipt was issued");
+        rab_broker_close(b);
+        cleanup_dir(dir);
+    }
+
+    /* (2) byte-quota refusal before the receipt append: size the quota to admit
+     * an apt.install/nginx intent but not its receipt. */
+    {
+        rab_config cfg;
+        rab_config_defaults(&cfg);
+        unsigned long long isz;
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_broker *m = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(m != NULL, "broker open (measure)");
+        {
+            const char *body =
+                "{\"type\":\"open_intent\",\"record\":{\"operation\":"
+                "\"apt.install\",\"resource\":\"nginx\",\"outcome\":\"intent\"}}";
+            rab_request req;
+            const char *e = NULL;
+            rab_parse_request(body, strlen(body), &req, &e);
+            char *resp = NULL;
+            rab_broker_handle(m, &a, &req, &resp);
+            rab_request_free(&req);
+            free(resp);
+        }
+        isz = (unsigned long long) file_size(path);
+        rab_broker_close(m);
+        cleanup_dir(dir);
+
+        cfg.rate_max_bytes_per_uid = isz + 100; /* admits intent, not +receipt */
+        cfg.rate_max_in_window = 1000;          /* keep op-count out of the way */
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "broker open (issue byte refusal)");
+        CHECK(strcmp(do_open_effect(b, &a, 1, ACC_PH, bind, cid, rcpt),
+                     "rate_limited") == 0,
+              "receipt append refused up front on byte quota");
+        CHECK(rab_broker_open_count(b) == 1, "the intent stayed open (byte)");
+        CHECK(rab_broker_receipt_state(b, cid) == -1, "no receipt (byte)");
+        rab_broker_close(b);
+        cleanup_dir(dir);
+    }
+
+    /* (3) redemption refusal: a receipt is issued, the bound actor's op window
+     * is then exhausted, so the redeemed append is refused rate_limited (charged
+     * to the bound original actor, not the root redeemer). */
+    {
+        rab_config cfg;
+        rab_config_defaults(&cfg);
+        cfg.rate_max_in_window = 3; /* intent + receipt (2), then room for 1 */
+        rab_actor root = mk_actor(0, 99, "boot-abc", "111");
+        rt_mut clk;
+        clk.now_us = 1000000ull;
+        snprintf(clk.boot, sizeof clk.boot, "boot-live");
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "broker open (redeem refusal)");
+        rab_broker_test_set_receipt_time(b, rt_mut_boottime, rt_mut_bootid, &clk);
+        CHECK(strcmp(do_open_effect(b, &a, 1, ACC_PH, bind, cid, rcpt), "OK") == 0,
+              "effect open (redeem refusal)");
+        CHECK(strcmp(do_emit(b, &a, "preview", NULL), "OK") == 0,
+              "one more op fits (window now full)");
+        CHECK(strcmp(do_redeem(b, &root, rcpt, 1000, "apt.install", "nginx", 1,
+                               ACC_PH, NULL),
+                     "rate_limited") == 0,
+              "the redeemed append is refused on the bound actor's op quota");
+        CHECK(rab_broker_receipt_state(b, cid) == 0,
+              "the receipt stays issued when the redeemed append is refused");
+        rab_broker_close(b);
+        cleanup_dir(dir);
+    }
+
+    /* (4) accounting survives a PLAIN restart (no rotation): both the intent and
+     * its receipt charges reconstruct, so a 2-op window is already full after
+     * restart and the next op is rate-limited -- without reconstructing the
+     * receipt charge it would fit. */
+    {
+        rab_config cfg;
+        rab_config_defaults(&cfg);
+        cfg.rate_max_in_window = 2; /* intent + receipt exactly fill it */
+        tmpdir(dir, sizeof dir);
+        sink_path(dir, path, sizeof path);
+        rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "broker open (accounting restart)");
+        CHECK(strcmp(do_open_effect(b, &a, 1, ACC_PH, bind, cid, rcpt), "OK") == 0,
+              "effect open (accounting restart)");
+        CHECK(count_archives(dir, "audit.jsonl") == 0, "no rotation happened");
+        rab_broker_close(b);
+        b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+        CHECK(b != NULL, "reopen (accounting restart)");
+        CHECK(count_archives(dir, "audit.jsonl") == 0, "still no rotation");
+        CHECK(strcmp(do_emit(b, &a, "preview", NULL), "rate_limited") == 0,
+              "the receipt's charge survived a plain restart (both ops counted)");
+        rab_broker_close(b);
+        cleanup_dir(dir);
+    }
 }
+#undef ACC_PH
 #undef EFF_PH
 
 static void test_bounded_open_intents(void) {

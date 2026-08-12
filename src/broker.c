@@ -59,6 +59,7 @@ typedef struct intent {
     unsigned long long rcpt_issue_boottime_us;
     unsigned long long rcpt_ttl_us;
     char rcpt_boot_id[RAB_BOOT_ID_MAX];
+    unsigned long long rcpt_accepted_time_us; /* wall-clock charge time (rate) */
     struct intent *hcid;  /* chain in the by-cid table */
     struct intent *hbind; /* chain in the by-binding table */
     struct intent *hrcpt; /* chain in the by-verifier table (has_receipt only) */
@@ -741,7 +742,7 @@ static int rotate(rab_broker *b) {
                     it->rcpt_actor_uid, it->rcpt_verb, it->rcpt_resource,
                     it->rcpt_plan_schema, it->rcpt_plan_hash,
                     it->rcpt_issue_boottime_us, it->rcpt_ttl_us,
-                    it->rcpt_boot_id);
+                    it->rcpt_boot_id, it->rcpt_accepted_time_us);
                 if (rl == NULL) {
                     rc = -1;
                     break;
@@ -942,6 +943,11 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
                                            sizeof token);
         if (irc != 0) {
             explicit_bzero(token, sizeof token);
+            if (irc == RAB_ISSUE_RATE_LIMITED) {
+                return reply(resp, rab_response_error(
+                                       "rate_limited",
+                                       "effect receipt write-quota exceeded"));
+            }
             return reply(resp, rab_response_error(
                                    "persist_failed",
                                    "effect receipt issuance failed"));
@@ -1131,6 +1137,9 @@ static int handle_redeem(rab_broker *b, const rab_actor *actor,
     case RAB_REDEEM_ALREADY:
         return reply(resp,
                      rab_response_error("receipt_redeemed", "already redeemed"));
+    case RAB_REDEEM_RATE:
+        return reply(resp, rab_response_error(
+                               "rate_limited", "redemption write-quota exceeded"));
     case RAB_REDEEM_UNKNOWN:
     case RAB_REDEEM_TOKEN:
         return reply(resp, rab_response_error("receipt_invalid",
@@ -1279,6 +1288,7 @@ static const char *apply_receipt(rab_broker *b, intent *it,
         it->rcpt_plan_schema = s->rcpt_plan_schema;
         it->rcpt_issue_boottime_us = s->rcpt_issue_boottime_us;
         it->rcpt_ttl_us = s->rcpt_ttl_us;
+        it->rcpt_accepted_time_us = s->rcpt_accepted_time_us;
         snprintf(it->verifier_hex, sizeof it->verifier_hex, "%s",
                  s->rcpt_verifier);
         snprintf(it->rcpt_verb, sizeof it->rcpt_verb, "%s", s->rcpt_verb);
@@ -1514,6 +1524,14 @@ static int reconstruct(rab_broker *b, const char **err) {
                  * stored line plus its newline. */
                 if (s.type == RAB_REC_AUDIT) {
                     rate_note(b, s.actor.uid, s.time_us,
+                              (unsigned long long) linelen + 1);
+                }
+                if (s.type == RAB_REC_RECEIPT && !s.rcpt_is_checkpoint) {
+                    /* a receipt TRANSITION (issued/redeemed) is a real durable
+                     * append: reconstruct its per-uid rate/byte charge on a plain
+                     * restart. A checkpoint (rotation carry) is skipped -- the
+                     * broker_rate record already carries the window at rotation. */
+                    rate_note(b, s.rcpt_actor_uid, s.rcpt_accepted_time_us,
                               (unsigned long long) linelen + 1);
                 }
                 rab_stored_free(&s);
@@ -1786,42 +1804,57 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
         explicit_bzero(vraw, sizeof vraw);
         return -1;
     }
+    /* Broker-assigned wall-clock accept time: embedded in the record so this
+     * append's per-uid charge reconstructs on a plain restart, and used for the
+     * quota check and accounting below. */
+    unsigned long long now = b->clock(b->clock_ctx);
     /* binds the intent's opener uid, verb (operation) and resource, plus the
      * caller's plan digest and the broker-assigned time/boot id */
     char *line = rab_build_receipt(it->cid, RAB_RCPT_ISSUED, 0, vhex,
                                    it->actor.uid, it->operation, it->resource,
                                    plan_schema, plan_hash, issue_boottime_us,
-                                   ttl_us, boot_id);
+                                   ttl_us, boot_id, now);
     int rc = -1;
-    if (line != NULL && append_line(b, line) == 0) {
-        /* Durable append + fdatasync succeeded: install the in-memory state
-         * only now (never before durability). */
+    if (line != NULL) {
         unsigned long long nbytes = (unsigned long long) strlen(line) + 1;
-        unsigned long long now = b->clock(b->clock_ctx);
-        it->has_receipt = 1;
-        it->rcpt_state = RAB_RCPT_ISSUED;
-        it->rcpt_actor_uid = it->actor.uid;
-        it->rcpt_plan_schema = plan_schema;
-        it->rcpt_issue_boottime_us = issue_boottime_us;
-        it->rcpt_ttl_us = ttl_us;
-        snprintf(it->verifier_hex, sizeof it->verifier_hex, "%s", vhex);
-        snprintf(it->rcpt_verb, sizeof it->rcpt_verb, "%s", it->operation);
-        snprintf(it->rcpt_resource, sizeof it->rcpt_resource, "%s",
-                 it->resource);
-        snprintf(it->rcpt_plan_hash, sizeof it->rcpt_plan_hash, "%s", plan_hash);
-        snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s", boot_id);
-        rcpt_index_add(b, it); /* verifier now set: index for wire redeem lookup */
-        /* The receipt append is a durable write: account it under the intent's
-         * opener (the bound actor) so per-uid quotas see it and it is carried
-         * across a restart, then rotate if the segment outgrew its cap. */
-        rate_note(b, it->actor.uid, now, nbytes);
-        global_bytes_note(b, now, nbytes);
-        maybe_rotate(b);
-        if (!b->poisoned) {
-            /* hand back the token only now: if rotation left durability
-             * uncertain, fail closed and return none. */
-            snprintf(out_token, out_cap, "%s", token);
-            rc = 0;
+        /* Quota CHECK before the append: the receipt is a durable write charged
+         * to the opener, so an opener over its op-count or byte quota is refused
+         * (rate_limited) rather than allowed to write past it. */
+        if (!rate_allowed(b, it->actor.uid, now) ||
+            !bytes_allowed(b, it->actor.uid, now, nbytes)) {
+            free(line);
+            explicit_bzero(token, sizeof token);
+            explicit_bzero(vraw, sizeof vraw);
+            return RAB_ISSUE_RATE_LIMITED;
+        }
+        if (append_line(b, line) == 0) {
+            /* Durable append + fdatasync succeeded: install the in-memory state
+             * only now (never before durability). */
+            it->has_receipt = 1;
+            it->rcpt_state = RAB_RCPT_ISSUED;
+            it->rcpt_actor_uid = it->actor.uid;
+            it->rcpt_plan_schema = plan_schema;
+            it->rcpt_issue_boottime_us = issue_boottime_us;
+            it->rcpt_ttl_us = ttl_us;
+            it->rcpt_accepted_time_us = now;
+            snprintf(it->verifier_hex, sizeof it->verifier_hex, "%s", vhex);
+            snprintf(it->rcpt_verb, sizeof it->rcpt_verb, "%s", it->operation);
+            snprintf(it->rcpt_resource, sizeof it->rcpt_resource, "%s",
+                     it->resource);
+            snprintf(it->rcpt_plan_hash, sizeof it->rcpt_plan_hash, "%s",
+                     plan_hash);
+            snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s", boot_id);
+            rcpt_index_add(b, it); /* verifier set: index for wire redeem lookup */
+            /* account the durable write under the opener; carried across restart */
+            rate_note(b, it->actor.uid, now, nbytes);
+            global_bytes_note(b, now, nbytes);
+            maybe_rotate(b);
+            if (!b->poisoned) {
+                /* hand back the token only now: if rotation left durability
+                 * uncertain, fail closed and return none. */
+                snprintf(out_token, out_cap, "%s", token);
+                rc = 0;
+            }
         }
     }
     /* line == NULL: invalid effect params (e.g. bad plan_hash) -> no effect.
@@ -1915,26 +1948,37 @@ rab_redeem_result rab_broker_redeem_receipt(rab_broker *b,
      * bound identity, verifier, issue time, TTL, and boot id as the issued
      * record, then advance the in-memory state ONLY after the append+fsync
      * succeeds. An append fault poisons the broker and leaves the state issued. */
+    /* wall-clock accept time: embedded so this redeemed charge reconstructs on a
+     * plain restart, and used for the quota check + accounting. */
+    unsigned long long now = b->clock(b->clock_ctx);
     char *line = rab_build_receipt(
         it->cid, RAB_RCPT_REDEEMED, 0, it->verifier_hex, it->rcpt_actor_uid,
         it->rcpt_verb, it->rcpt_resource, it->rcpt_plan_schema, it->rcpt_plan_hash,
-        it->rcpt_issue_boottime_us, it->rcpt_ttl_us, it->rcpt_boot_id);
+        it->rcpt_issue_boottime_us, it->rcpt_ttl_us, it->rcpt_boot_id, now);
     if (line == NULL) {
         return RAB_REDEEM_PERSIST;
     }
     unsigned long long nbytes = (unsigned long long) strlen(line) + 1;
+    /* Quota CHECK before the append, charged to the bound ORIGINAL actor (not the
+     * root redeemer): an actor over its op/byte quota is refused rather than
+     * allowed to write the redeemed transition past it. */
+    if (!rate_allowed(b, it->rcpt_actor_uid, now) ||
+        !bytes_allowed(b, it->rcpt_actor_uid, now, nbytes)) {
+        free(line);
+        return RAB_REDEEM_RATE;
+    }
     int arc = append_line(b, line);
     free(line);
     if (arc != 0) {
         return RAB_REDEEM_PERSIST; /* append_line already poisoned */
     }
     it->rcpt_state = RAB_RCPT_REDEEMED;
-    /* Account the redeemed append under the bound ORIGINAL actor (not the root
-     * redeemer) so the volume is attributed to the principal who initiated the
-     * operation and is carried across a restart, then rotate. A post-append
-     * rotation poisoning is a failure: the redeemed state is durable, but its
-     * durability is uncertain, so do not report success. */
-    unsigned long long now = b->clock(b->clock_ctx);
+    it->rcpt_accepted_time_us = now;
+    /* Account the redeemed append under the bound ORIGINAL actor so the volume
+     * is attributed to the principal who initiated the operation and carried
+     * across a restart, then rotate. A post-append rotation poisoning is a
+     * failure: the redeemed state is durable, but its durability is uncertain,
+     * so do not report success. */
     rate_note(b, it->rcpt_actor_uid, now, nbytes);
     global_bytes_note(b, now, nbytes);
     maybe_rotate(b);
