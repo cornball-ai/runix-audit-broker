@@ -1440,6 +1440,60 @@ static const char *do_redeem(rab_broker *b, const rab_actor *actor,
     return ret;
 }
 
+/* Send an effect open_intent (operation "apt.install", resource "nginx"); on
+ * open_ok copies cid/binding/effect_receipt out. Returns the response code. */
+static const char *do_open_effect(rab_broker *b, const rab_actor *actor,
+                                  long long plan_schema, const char *plan_hash,
+                                  char *binding, char *cid, char *receipt) {
+    char body[1024];
+    snprintf(body, sizeof body,
+             "{\"type\":\"open_intent\",\"record\":{\"operation\":\"apt.install\","
+             "\"resource\":\"nginx\",\"outcome\":\"intent\"},\"effect\":"
+             "{\"required\":true,\"plan_schema\":%lld,\"plan_hash\":\"%s\"}}",
+             plan_schema, plan_hash);
+    rab_request req;
+    const char *e = NULL;
+    if (rab_parse_request(body, strlen(body), &req, &e) != 0) {
+        return "PARSE_FAIL";
+    }
+    char *resp = NULL;
+    int rc = rab_broker_handle(b, actor, &req, &resp);
+    rab_request_free(&req);
+    if (rc != 0 || resp == NULL) {
+        return "HANDLE_FAIL";
+    }
+    static char code[32];
+    json_error_t je;
+    json_t *r = json_loads(resp, 0, &je);
+    free(resp);
+    if (r == NULL) {
+        return "RESP_PARSE_FAIL";
+    }
+    const char *ret = "OK";
+    if (json_is_true(json_object_get(r, "ok"))) {
+        json_t *jb = json_object_get(r, "binding");
+        json_t *jc = json_object_get(r, "correlation_id");
+        json_t *jr = json_object_get(r, "effect_receipt");
+        if (binding && json_is_string(jb)) {
+            snprintf(binding, RAB_BINDING_STR_MAX, "%s", json_string_value(jb));
+        }
+        if (cid && json_is_string(jc)) {
+            snprintf(cid, RAB_CID_MAX, "%s", json_string_value(jc));
+        }
+        if (receipt) {
+            snprintf(receipt, RAB_RECEIPT_MAX, "%s",
+                     json_is_string(jr) ? json_string_value(jr) : "");
+        }
+    } else {
+        json_t *err = json_object_get(r, "error");
+        snprintf(code, sizeof code, "%s",
+                 json_is_string(err) ? json_string_value(err) : "?");
+        ret = code;
+    }
+    json_decref(r);
+    return ret;
+}
+
 static void test_redeem_wire(void) {
     char dir[256], path[512];
     const char *err = NULL;
@@ -2209,47 +2263,78 @@ static void test_capabilities(void) {
  * unbacked: a typed refusal, and crucially never a downgrade to an ordinary
  * intent (which would silently drop the effect binding). Nothing is opened,
  * nothing is appended, and reconstruction sees no trace. */
-static void test_effect_fail_closed(void) {
+/* 3c: the full effect loop over the wire -- issuance wired into open_intent,
+ * the receipt handed back in open_ok, redeemed by the root helper, the effect
+ * outcome gated on that redemption, and the whole thing durable across a
+ * restart. The mint collision check keeps the receipt distinct from the
+ * binding. */
+#define EFF_PH \
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+static void test_effect_open_wire(void) {
     char dir[256], path[512];
-    tmpdir(dir, sizeof dir);
-    sink_path(dir, path, sizeof path);
+    const char *err = NULL;
     rab_config cfg;
     rab_config_defaults(&cfg);
-    const char *err = NULL;
     rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    rab_actor root = mk_actor(0, 99, "boot-abc", "111");
+    rt_mut clk;
+
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    clk.now_us = 1000000ull;
+    snprintf(clk.boot, sizeof clk.boot, "boot-live");
     rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
-    CHECK(b != NULL, "broker open (effect fail-closed)");
+    CHECK(b != NULL, "broker open (effect open wire)");
+    rab_broker_test_set_receipt_time(b, rt_mut_boottime, rt_mut_bootid, &clk);
 
-    long before = file_size(path);
-    const char *body =
-        "{\"type\":\"open_intent\",\"record\":"
-        "{\"operation\":\"apt.install\",\"outcome\":\"intent\"},"
-        "\"effect\":{\"required\":true,\"plan_schema\":1,\"plan_hash\":"
-        "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}}";
-    rab_request req;
-    const char *e = NULL;
-    CHECK(rab_parse_request(body, strlen(body), &req, &e) == 0, "parse effect req");
-    char *resp = NULL;
-    int rc = rab_broker_handle(b, &a, &req, &resp);
-    rab_request_free(&req);
-    CHECK(rc == 0 && resp != NULL, "effect open handled");
-    /* refused with an existing contracted code (issuance replaces this guard) */
-    CHECK(resp != NULL && strstr(resp, "\"error\":\"schema_invalid\"") != NULL,
-          "effect request refused (schema_invalid, an accepted code)");
-    free(resp);
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX], rcpt[RAB_RECEIPT_MAX];
+    CHECK(strcmp(do_open_effect(b, &a, 1, EFF_PH, bind, cid, rcpt), "OK") == 0,
+          "effect open succeeds with a receipt");
+    CHECK(strlen(rcpt) == 32, "open_ok carries a 32-hex effect receipt");
+    CHECK(strcmp(rcpt, bind) != 0, "the receipt is distinct from the binding");
+    CHECK(rab_broker_receipt_state(b, cid) == 0, "receipt issued at open");
 
-    /* no downgrade: nothing opened, sink grew by zero bytes */
-    CHECK(rab_broker_open_count(b) == 0, "effect request opened no intent");
-    CHECK(file_size(path) == before, "effect request appended nothing");
+    /* an effect outcome before redemption is refused (opt-in gate) */
+    CHECK(strcmp(do_outcome_ei(b, &a, bind, 1), "effect_without_receipt") == 0,
+          "effect outcome before redemption refused");
+
+    /* the helper redeems the receipt it was handed, then the outcome is accepted */
+    CHECK(strcmp(do_redeem(b, &root, rcpt, 1000, "apt.install", "nginx", 1, EFF_PH,
+                           NULL), "OK") == 0, "the issued receipt redeems");
+    CHECK(rab_broker_receipt_state(b, cid) == 1, "receipt redeemed");
+    CHECK(strcmp(do_outcome_ei(b, &a, bind, 1), "OK") == 0,
+          "effect outcome accepted after redemption");
     rab_broker_close(b);
-
-    /* durable proof: reconstruction sees an empty broker */
     b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
-    CHECK(b != NULL && rab_broker_open_count(b) == 0,
-          "refused effect left no durable trace");
+    CHECK(b != NULL && !rab_broker_has_open(b, cid),
+          "the closed effect intent did not survive (outcome written)");
+    rab_broker_close(b);
+    cleanup_dir(dir);
+
+    /* the full loop across a restart: issue over the wire, restart (reconstruct
+     * the issued receipt), then redeem the reconstructed receipt over the wire. */
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    clk.now_us = 1000000ull;
+    snprintf(clk.boot, sizeof clk.boot, "boot-live");
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (effect restart)");
+    rab_broker_test_set_receipt_time(b, rt_mut_boottime, rt_mut_bootid, &clk);
+    CHECK(strcmp(do_open_effect(b, &a, 1, EFF_PH, bind, cid, rcpt), "OK") == 0,
+          "effect open (restart)");
+    rab_broker_close(b);
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "reopen (effect restart)");
+    CHECK(rab_broker_receipt_state(b, cid) == 0, "issued receipt reconstructs");
+    rab_broker_test_set_receipt_time(b, rt_mut_boottime, rt_mut_bootid, &clk);
+    CHECK(strcmp(do_redeem(b, &root, rcpt, 1000, "apt.install", "nginx", 1, EFF_PH,
+                           NULL), "OK") == 0,
+          "a reconstructed issued receipt redeems over the wire");
+    CHECK(rab_broker_receipt_state(b, cid) == 1, "redeemed after restart");
     rab_broker_close(b);
     cleanup_dir(dir);
 }
+#undef EFF_PH
 
 static void test_bounded_open_intents(void) {
     char dir[256], path[512];
@@ -2837,7 +2922,7 @@ int main(void) {
     test_free_space_refusal();
     test_emit();
     test_capabilities();
-    test_effect_fail_closed();
+    test_effect_open_wire();
     test_carry_forward_idempotency();
     test_rotation_preserves_open_intents();
     test_bounded_open_intents();

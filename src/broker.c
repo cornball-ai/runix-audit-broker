@@ -25,6 +25,11 @@
 /* Upper bound on any hash table's bucket count (memory backstop). */
 #define RAB_MAX_BUCKETS ((size_t) 1 << 20)
 
+/* Bounded re-mint attempts for an effect-receipt token that collides with the
+ * intent's binding or an existing receipt verifier (see the mint loop in
+ * rab_broker_issue_receipt); exhausting them fails issuance closed. */
+#define RAB_RECEIPT_MINT_TRIES 8
+
 /* ---- state ------------------------------------------------------------- */
 
 /* Open intents are held in two hash tables over the SAME nodes: by cid (for
@@ -839,19 +844,6 @@ static void rec_str(json_t *record, const char *key, char *dst, size_t cap) {
 
 static int handle_open(rab_broker *b, const rab_actor *actor,
                        const rab_request *req, char **resp) {
-    /* Effect-receipt issuance is not yet backed by durable receipt state, so an
-     * open_intent requesting an effect FAILS CLOSED here. It must never be
-     * downgraded to an ordinary intent, which would silently drop the effect
-     * binding. Until issuance lands this reuses the existing, contracted
-     * `schema_invalid` refusal (a code the R/helper adapters already accept)
-     * rather than emitting an uncontracted one; the guard is removed once
-     * issuance exists, and the capability stays unadvertised so no conforming
-     * client reaches this path. */
-    if (req->effect_present) {
-        return reply(resp, rab_response_error(
-                               "schema_invalid",
-                               "effect receipts are not available on this broker"));
-    }
     unsigned long long now = b->clock(b->clock_ctx);
     if (!rate_allowed(b, actor->uid, now)) {
         return reply(resp,
@@ -918,6 +910,28 @@ static int handle_open(rab_broker *b, const rab_actor *actor,
         return reply(resp, rab_response_error(
                                "persist_failed",
                                "audit durability uncertain after rotation"));
+    }
+    /* An effect open issues a receipt bound to the just-opened intent and hands
+     * it back alongside the binding. Issuance appends the broker_receipt durably
+     * (fsync) before this reply. It fails CLOSED: on any issuance failure the
+     * intent stays durably open (a reconcilable open-no-effect record), but the
+     * client is told issuance failed rather than handed a success carrying no
+     * receipt -- which would silently drop the effect authorization. */
+    if (req->effect_present) {
+        char token[RAB_RECEIPT_MAX];
+        int irc = rab_broker_issue_receipt(b, cid,
+                                           (long long) req->effect_plan_schema,
+                                           req->effect_plan_hash, token,
+                                           sizeof token);
+        if (irc != 0) {
+            explicit_bzero(token, sizeof token);
+            return reply(resp, rab_response_error(
+                                   "persist_failed",
+                                   "effect receipt issuance failed"));
+        }
+        char *r = rab_response_open_ok(cid, binding, "system", token);
+        explicit_bzero(token, sizeof token);
+        return reply(resp, r);
     }
     return reply(resp, rab_response_open_ok(cid, binding, "system", NULL));
 }
@@ -1719,13 +1733,28 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
     char token[RAB_RECEIPT_MAX];
     unsigned char vraw[RAB_SHA256_LEN];
     char vhex[RAB_SHA256_HEX_MAX];
-    if (rab_make_receipt(token, sizeof token) != 0 ||
-        rab_sha256(token, strlen(token), vraw) != 0) {
+    /* Mint a token whose value differs from this intent's binding and whose
+     * verifier is not already indexed by a live receipt. At 128 bits a collision
+     * is astronomically unlikely, but it is checked explicitly and re-minted
+     * rather than assumed away; exhausting the bounded retries fails closed. */
+    int minted = 0;
+    for (int attempt = 0; attempt < RAB_RECEIPT_MINT_TRIES; attempt++) {
+        if (rab_make_receipt(token, sizeof token) != 0 ||
+            rab_sha256(token, strlen(token), vraw) != 0) {
+            break; /* CSPRNG or digest failure: fail closed */
+        }
+        hex_encode(vraw, RAB_SHA256_LEN, vhex);
+        if (strcmp(token, it->binding) != 0 &&
+            open_find_verifier(b, vhex) == NULL) {
+            minted = 1;
+            break;
+        }
+    }
+    if (!minted) {
         explicit_bzero(token, sizeof token);
         explicit_bzero(vraw, sizeof vraw);
         return -1;
     }
-    hex_encode(vraw, RAB_SHA256_LEN, vhex);
     /* binds the intent's opener uid, verb (operation) and resource, plus the
      * caller's plan digest and the broker-assigned time/boot id */
     char *line = rab_build_receipt(it->cid, RAB_RCPT_ISSUED, 0, vhex,
