@@ -438,9 +438,9 @@ static int parses_ok(const char *s) {
  * correlation_id "c", verb "apt.install", resource "nginx", boot_id "b"). */
 #define RCPT(ssv, state, ver, uid, ps, ph, ibt, ttl)                          \
     "{\"schema_version\":1,\"record_type\":\"broker_receipt\","               \
-    "\"state_schema_version\":" ssv ",\"correlation_id\":\"c\",\"state\":\""  \
-    state "\",\"verifier\":\"" ver "\",\"actor_uid\":" uid ",\"verb\":"       \
-    "\"apt.install\",\"resource\":\"nginx\",\"plan_schema\":" ps              \
+    "\"state_schema_version\":" ssv ",\"correlation_id\":\"c\",\"checkpoint\":" \
+    "false,\"state\":\"" state "\",\"verifier\":\"" ver "\",\"actor_uid\":"    \
+    uid ",\"verb\":\"apt.install\",\"resource\":\"nginx\",\"plan_schema\":" ps \
     ",\"plan_hash\":\"" ph "\",\"issue_boottime_us\":\"" ibt "\",\"ttl_us\":" \
     "\"" ttl "\",\"boot_id\":\"b\"}"
 
@@ -467,7 +467,7 @@ static void test_receipt_record(void) {
         char vhex[RAB_SHA256_HEX_MAX];
         CHECK(rab_sha256(tok, strlen(tok), vraw) == 0, "verifier derived");
         rcpt_hex(vraw, RAB_SHA256_LEN, vhex);
-        char *g = rab_build_receipt("cid-g1", RAB_RCPT_ISSUED, vhex, 1000,
+        char *g = rab_build_receipt("cid-g1", RAB_RCPT_ISSUED, 0, vhex, 1000,
                                     "apt.install", "nginx", 1, RCPT_HX, 1ull,
                                     2ull, "b");
         CHECK(g != NULL, "receipt built with a real verifier");
@@ -478,7 +478,7 @@ static void test_receipt_record(void) {
         }
     }
 
-    char *line = rab_build_receipt("cid-r1", RAB_RCPT_ISSUED, RCPT_HX, 1000,
+    char *line = rab_build_receipt("cid-r1", RAB_RCPT_ISSUED, 0, RCPT_HX, 1000,
                                    "apt.install", "nginx", 1, RCPT_HX, 500000ull,
                                    30000000ull, "boot-xyz");
     CHECK(line != NULL, "receipt record built");
@@ -487,6 +487,7 @@ static void test_receipt_record(void) {
         CHECK(rab_parse_stored(line, strlen(line), &s) == 0, "receipt parses");
         CHECK(s.type == RAB_REC_RECEIPT, "parsed as receipt");
         CHECK(strcmp(s.correlation_id, "cid-r1") == 0, "cid round-trips");
+        CHECK(s.rcpt_is_checkpoint == 0, "transition marker round-trips");
         CHECK(s.rcpt_state == RAB_RCPT_ISSUED, "state issued round-trips");
         CHECK(strcmp(s.rcpt_verifier, RCPT_HX) == 0, "verifier round-trips");
         CHECK(s.rcpt_actor_uid == 1000, "actor_uid round-trips");
@@ -501,13 +502,14 @@ static void test_receipt_record(void) {
         free(line);
     }
     /* a redeemed receipt with an empty resource round-trips its state too */
-    line = rab_build_receipt("cid-r2", RAB_RCPT_REDEEMED, RCPT_HX, 0,
+    line = rab_build_receipt("cid-r2", RAB_RCPT_REDEEMED, 1, RCPT_HX, 0,
                              "apt.update", "", 2, RCPT_HX, 1ull, 2ull, "b");
     CHECK(line != NULL, "redeemed receipt built");
     if (line != NULL) {
         rab_stored s;
         CHECK(rab_parse_stored(line, strlen(line), &s) == 0, "redeemed parses");
         CHECK(s.rcpt_state == RAB_RCPT_REDEEMED, "state redeemed round-trips");
+        CHECK(s.rcpt_is_checkpoint == 1, "checkpoint marker round-trips");
         CHECK(s.rcpt_resource[0] == '\0', "empty resource round-trips");
         rab_stored_free(&s);
         free(line);
@@ -543,54 +545,382 @@ static void test_receipt_record(void) {
     CHECK(!parses_ok(RCPT("1", "issued", RCPT_HX, "1000", "1", RCPT_HX, "x",
                           "30")),
           "non-numeric issue_boottime_us rejected");
-    /* missing field, extra field, duplicate key */
-    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
-                     "\"state_schema_version\":1,\"correlation_id\":\"c\","
-                     "\"state\":\"issued\",\"verifier\":\"" RCPT_HX "\","
-                     "\"actor_uid\":1000,\"verb\":\"apt.install\",\"resource\":"
-                     "\"nginx\",\"plan_schema\":1,\"plan_hash\":\"" RCPT_HX "\","
-                     "\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\"}"),
-          "missing boot_id rejected");
+    /* missing checkpoint marker, missing field, extra field, duplicate key */
     CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
                      "\"state_schema_version\":1,\"correlation_id\":\"c\","
                      "\"state\":\"issued\",\"verifier\":\"" RCPT_HX "\","
                      "\"actor_uid\":1000,\"verb\":\"apt.install\",\"resource\":"
                      "\"nginx\",\"plan_schema\":1,\"plan_hash\":\"" RCPT_HX "\","
                      "\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\",\"boot_id\":"
-                     "\"b\",\"extra\":1}"),
+                     "\"b\"}"),
+          "missing checkpoint marker rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
+                     "\"state_schema_version\":1,\"correlation_id\":\"c\","
+                     "\"checkpoint\":false,\"state\":\"issued\",\"verifier\":\""
+                     RCPT_HX "\",\"actor_uid\":1000,\"verb\":\"apt.install\","
+                     "\"resource\":\"nginx\",\"plan_schema\":1,\"plan_hash\":\""
+                     RCPT_HX "\",\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\"}"),
+          "missing boot_id rejected");
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
+                     "\"state_schema_version\":1,\"correlation_id\":\"c\","
+                     "\"checkpoint\":false,\"state\":\"issued\",\"verifier\":\""
+                     RCPT_HX "\",\"actor_uid\":1000,\"verb\":\"apt.install\","
+                     "\"resource\":\"nginx\",\"plan_schema\":1,\"plan_hash\":\""
+                     RCPT_HX "\",\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\","
+                     "\"boot_id\":\"b\",\"extra\":1}"),
           "extra key on receipt rejected");
     CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
                      "\"state_schema_version\":1,\"correlation_id\":\"c\","
-                     "\"correlation_id\":\"d\",\"state\":\"issued\",\"verifier\":"
-                     "\"" RCPT_HX "\",\"actor_uid\":1000,\"verb\":\"apt.install\","
+                     "\"correlation_id\":\"d\",\"checkpoint\":false,\"state\":"
+                     "\"issued\",\"verifier\":\"" RCPT_HX "\",\"actor_uid\":1000,"
+                     "\"verb\":\"apt.install\",\"resource\":\"nginx\","
+                     "\"plan_schema\":1,\"plan_hash\":\"" RCPT_HX "\","
+                     "\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\",\"boot_id\":"
+                     "\"b\"}"),
+          "duplicate key on receipt rejected");
+    /* a non-boolean checkpoint marker is rejected */
+    CHECK(!parses_ok("{\"schema_version\":1,\"record_type\":\"broker_receipt\","
+                     "\"state_schema_version\":1,\"correlation_id\":\"c\","
+                     "\"checkpoint\":\"yes\",\"state\":\"issued\",\"verifier\":\""
+                     RCPT_HX "\",\"actor_uid\":1000,\"verb\":\"apt.install\","
                      "\"resource\":\"nginx\",\"plan_schema\":1,\"plan_hash\":\""
                      RCPT_HX "\",\"issue_boottime_us\":\"5\",\"ttl_us\":\"30\","
                      "\"boot_id\":\"b\"}"),
-          "duplicate key on receipt rejected");
+          "non-boolean checkpoint rejected");
 
     /* the builder is itself fail-closed: it never emits a record the parser
      * would reject, and never silently coerces an unknown state to "issued". */
-    CHECK(rab_build_receipt("c", (rab_rcpt_state) 7, RCPT_HX, 1, "v", "r", 1,
+    CHECK(rab_build_receipt("c", (rab_rcpt_state) 7, 0, RCPT_HX, 1, "v", "r", 1,
                             RCPT_HX, 1, 2, "b") == NULL,
           "builder rejects an unknown state");
-    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, "nothex", 1, "v", "r", 1,
+    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, 0, "nothex", 1, "v", "r", 1,
                             RCPT_HX, 1, 2, "b") == NULL,
           "builder rejects a malformed verifier");
-    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, RCPT_HX, 1, "v", "r", 1,
+    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, 0, RCPT_HX, 1, "v", "r", 1,
                             "nothex", 1, 2, "b") == NULL,
           "builder rejects a malformed plan_hash");
-    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, RCPT_HX, 1, "v", "r", 0,
+    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, 0, RCPT_HX, 1, "v", "r", 0,
                             RCPT_HX, 1, 2, "b") == NULL,
           "builder rejects plan_schema 0");
-    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, RCPT_HX, 1, "", "r", 1,
+    CHECK(rab_build_receipt("c", RAB_RCPT_ISSUED, 0, RCPT_HX, 1, "", "r", 1,
                             RCPT_HX, 1, 2, "b") == NULL,
           "builder rejects an empty verb");
-    CHECK(rab_build_receipt("", RAB_RCPT_ISSUED, RCPT_HX, 1, "v", "r", 1,
+    CHECK(rab_build_receipt("", RAB_RCPT_ISSUED, 0, RCPT_HX, 1, "v", "r", 1,
                             RCPT_HX, 1, 2, "b") == NULL,
           "builder rejects an empty correlation_id");
 }
 #undef RCPT
 #undef RCPT_HX
+
+/* --- 2b-ii: receipt state machine (issue, reconstruction, rotation) --- */
+#define RS_PH \
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+#define RS_V1 \
+    "1111111111111111111111111111111111111111111111111111111111111111"
+#define RS_V2 \
+    "2222222222222222222222222222222222222222222222222222222222222222"
+
+/* Write record lines (each newline-terminated) to a fresh sink at path. */
+static void write_segment(const char *path, char *const *lines, size_t n) {
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (lines[i] != NULL) {
+            fputs(lines[i], f);
+            fputc('\n', f);
+        }
+    }
+    fclose(f);
+}
+
+/* Build a valid audit intent line for a known cid/binding (caller frees). */
+static char *mk_intent_line(const char *cid, const char *binding,
+                            const rab_actor *a) {
+    json_t *rec = json_object();
+    json_object_set_new(rec, "operation", json_string("apt.install"));
+    json_object_set_new(rec, "outcome", json_string("intent"));
+    char *line = rab_build_audit(RAB_PHASE_INTENT, cid, binding, a, "host",
+                                 1700000000000000ull, rec);
+    json_decref(rec);
+    return line;
+}
+
+/* Build a broker_receipt line for cid with the given state/checkpoint/verifier
+ * and verb, other bound fields fixed (caller frees). */
+static char *mk_rcpt_line(const char *cid, rab_rcpt_state st, int ckpt,
+                          const char *verifier, const char *verb) {
+    return rab_build_receipt(cid, st, ckpt, verifier, 1000, verb, "nginx", 1,
+                             RS_PH, 111ull, 222ull, "boot-broker");
+}
+
+/* Write a crafted segment and attempt reconstruction. Returns 1 if the broker
+ * opened (reconstruction succeeded), else 0. On success, if rstate != NULL, the
+ * reconstructed receipt state for `cid` is written into *rstate. */
+static int recon_segment(char *const *lines, size_t n, const char *cid,
+                         int *rstate) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    write_segment(path, lines, n);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    const char *err = NULL;
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    int ok = (b != NULL);
+    if (ok) {
+        if (rstate != NULL) {
+            *rstate = rab_broker_receipt_state(b, cid);
+        }
+        rab_broker_close(b);
+    }
+    cleanup_dir(dir);
+    return ok;
+}
+
+/* Count broker_receipt lines mentioning `cid` in the current segment. */
+static int count_receipt_records(const char *path, const char *cid) {
+    FILE *f = fopen(path, "r");
+    int n = 0;
+    if (f != NULL) {
+        char ln[8192];
+        while (fgets(ln, sizeof ln, f)) {
+            if (strstr(ln, "broker_receipt") != NULL &&
+                strstr(ln, cid) != NULL) {
+                n++;
+            }
+        }
+        fclose(f);
+    }
+    return n;
+}
+
+/* Gates 2, 3, 5, and 6(safe): live issuance, restart reconstruction, rotation
+ * carry, torn-append poison, and the crash-between (intent without receipt). */
+static void test_receipt_state_machine(void) {
+    char dir[256], path[512];
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    const char *err = NULL;
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (receipt issue)");
+
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX];
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0, "open effect intent");
+    CHECK(rab_broker_receipt_state(b, cid) == -1, "no receipt before issue");
+    char tok[RAB_RECEIPT_MAX] = {0};
+    CHECK(rab_broker_issue_receipt(b, cid, 1, RS_PH, 500000ull, 30000000ull,
+                                   "boot-broker", tok, sizeof tok) == 0,
+          "receipt issued");
+    CHECK(strlen(tok) == 32, "issued token is 128-bit (32 hex)");
+    CHECK(rab_broker_receipt_state(b, cid) == 0, "receipt state issued");
+    char tok2[RAB_RECEIPT_MAX] = {0};
+    CHECK(rab_broker_issue_receipt(b, cid, 1, RS_PH, 1ull, 2ull, "boot-broker",
+                                   tok2, sizeof tok2) == -1,
+          "a second issue for the same intent is refused");
+    /* the durable record carries the verifier, never the live token */
+    CHECK(count_receipt_records(path, cid) == 1, "one issued receipt persisted");
+    {
+        FILE *f = fopen(path, "r");
+        int found_tok = 0;
+        if (f != NULL) {
+            char ln[8192];
+            while (fgets(ln, sizeof ln, f)) {
+                if (strstr(ln, tok) != NULL) {
+                    found_tok = 1;
+                }
+            }
+            fclose(f);
+        }
+        CHECK(!found_tok, "the live token never appears in the sink");
+    }
+    rab_broker_close(b);
+
+    /* Gate 2: restart reconstructs the exact issued state */
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker reopen (receipt reconstruct)");
+    CHECK(rab_broker_has_open(b, cid), "intent survived restart");
+    CHECK(rab_broker_receipt_state(b, cid) == 0,
+          "issued receipt state reconstructs exactly");
+    rab_broker_close(b);
+    cleanup_dir(dir);
+
+    /* Gate 6 (safe): an intent whose receipt append never happened (crash
+     * between the two appends) reconstructs as an open intent with NO receipt --
+     * no usable authorization, never a receipt without an intent. */
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (crash between)");
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0, "open intent, no issue");
+    rab_broker_close(b);
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL && rab_broker_has_open(b, cid),
+          "intent-without-receipt survives restart");
+    CHECK(rab_broker_receipt_state(b, cid) == -1,
+          "an intent with no receipt confers no authorization");
+    rab_broker_close(b);
+    cleanup_dir(dir);
+
+    /* Gate 5: a torn receipt append poisons the broker and yields no token and
+     * no in-memory receipt state. */
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (issue fail)");
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0, "open intent (issue fail)");
+    rab_broker_test_fail_next_append(b);
+    char tokf[RAB_RECEIPT_MAX] = {0};
+    CHECK(rab_broker_issue_receipt(b, cid, 1, RS_PH, 1ull, 2ull, "boot-broker",
+                                   tokf, sizeof tokf) == -1,
+          "issue fails when the receipt append tears");
+    CHECK(tokf[0] == '\0', "no token returned on a torn append");
+    CHECK(rab_broker_receipt_state(b, cid) == -1,
+          "no in-memory receipt state after a failed issue");
+    CHECK(rab_broker_poisoned(b), "broker poisoned after a torn receipt append");
+    rab_broker_close(b);
+    cleanup_dir(dir);
+
+    /* Gate 3: rotation carries exactly one receipt checkpoint per still-open
+     * effect intent; the state survives rotation + restart. */
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_config cfg2;
+    rab_config_defaults(&cfg2);
+    cfg2.rotate_bytes = 256; /* rotate frequently */
+    cfg2.max_open_per_uid = 100;
+    unsigned long long save_step = g_step;
+    g_step = 2; /* distinct archive suffixes */
+    b = rab_broker_open(path, &cfg2, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (receipt rotation)");
+    CHECK(strcmp(do_open(b, &a, bind, cid), "OK") == 0, "open effect intent (rot)");
+    CHECK(rab_broker_issue_receipt(b, cid, 1, RS_PH, 500000ull, 30000000ull,
+                                   "boot-broker", tok, sizeof tok) == 0,
+          "receipt issued (rot)");
+    int emits_ok = 1;
+    for (int i = 0; i < 8; i++) {
+        if (strcmp(do_emit(b, &a, "preview", NULL), "OK") != 0) {
+            emits_ok = 0;
+        }
+    }
+    CHECK(emits_ok, "emits across rotations succeed");
+    CHECK(count_archives(dir, "audit.jsonl") >= 1, "rotation happened (receipt)");
+    CHECK(rab_broker_receipt_state(b, cid) == 0, "receipt survives rotation live");
+    rab_broker_close(b);
+    b = rab_broker_open(path, &cfg2, test_clock, NULL, &err);
+    CHECK(b != NULL, "reopen after receipt rotation");
+    CHECK(rab_broker_has_open(b, cid),
+          "receipted intent survived rotation+restart");
+    CHECK(rab_broker_receipt_state(b, cid) == 0,
+          "issued receipt state carried once and reconstructed");
+    CHECK(count_receipt_records(path, cid) == 1,
+          "exactly one receipt checkpoint per open intent");
+    rab_broker_close(b);
+    g_step = save_step;
+    cleanup_dir(dir);
+}
+
+/* Gate 4: reconstruction of conflicting/duplicate receipt transition records
+ * (crafted segments). Gate 6: an orphan receipt fails startup closed. */
+static void test_receipt_reconstruction_conflicts(void) {
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    char *intent_line = mk_intent_line("cid-x", "bindx", &a);
+    CHECK(intent_line != NULL, "crafted intent line built");
+
+    /* equivalent duplicate issued -> idempotent, opens with an issued receipt */
+    {
+        char *r1 = mk_rcpt_line("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
+        char *r2 = mk_rcpt_line("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
+        char *ls[] = {intent_line, r1, r2};
+        int st = -9;
+        CHECK(recon_segment(ls, 3, "cid-x", &st) == 1,
+              "equivalent duplicate issued reconstructs");
+        CHECK(st == 0, "idempotent replay stays issued");
+        free(r1);
+        free(r2);
+    }
+    /* conflicting duplicate (different verifier) -> fail closed */
+    {
+        char *r1 = mk_rcpt_line("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
+        char *r2 = mk_rcpt_line("cid-x", RAB_RCPT_ISSUED, 0, RS_V2, "apt.install");
+        char *ls[] = {intent_line, r1, r2};
+        CHECK(recon_segment(ls, 3, "cid-x", NULL) == 0,
+              "conflicting duplicate verifier fails closed");
+        free(r1);
+        free(r2);
+    }
+    /* conflicting bound identity (different verb) -> fail closed */
+    {
+        char *r1 = mk_rcpt_line("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
+        char *r2 = mk_rcpt_line("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, "apt.remove");
+        char *ls[] = {intent_line, r1, r2};
+        CHECK(recon_segment(ls, 3, "cid-x", NULL) == 0,
+              "conflicting bound verb fails closed");
+        free(r1);
+        free(r2);
+    }
+    /* a redeemed TRANSITION with no prior issued -> fail closed */
+    {
+        char *r1 = mk_rcpt_line("cid-x", RAB_RCPT_REDEEMED, 0, RS_V1,
+                                "apt.install");
+        char *ls[] = {intent_line, r1};
+        CHECK(recon_segment(ls, 2, "cid-x", NULL) == 0,
+              "redeem-before-issue transition fails closed");
+        free(r1);
+    }
+    /* a redeemed CHECKPOINT stands alone -> reconstructs redeemed */
+    {
+        char *r1 = mk_rcpt_line("cid-x", RAB_RCPT_REDEEMED, 1, RS_V1,
+                                "apt.install");
+        char *ls[] = {intent_line, r1};
+        int st = -9;
+        CHECK(recon_segment(ls, 2, "cid-x", &st) == 1,
+              "redeemed checkpoint stands alone");
+        CHECK(st == 1, "redeemed checkpoint reconstructs redeemed");
+        free(r1);
+    }
+    /* issued then redeemed (equivalent) -> valid progression */
+    {
+        char *r1 = mk_rcpt_line("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
+        char *r2 = mk_rcpt_line("cid-x", RAB_RCPT_REDEEMED, 0, RS_V1,
+                                "apt.install");
+        char *ls[] = {intent_line, r1, r2};
+        int st = -9;
+        CHECK(recon_segment(ls, 3, "cid-x", &st) == 1,
+              "issued->redeemed progression reconstructs");
+        CHECK(st == 1, "progression ends redeemed");
+        free(r1);
+        free(r2);
+    }
+    /* redeemed then issued -> inconsistent regression, fail closed */
+    {
+        char *r1 = mk_rcpt_line("cid-x", RAB_RCPT_REDEEMED, 1, RS_V1,
+                                "apt.install");
+        char *r2 = mk_rcpt_line("cid-x", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
+        char *ls[] = {intent_line, r1, r2};
+        CHECK(recon_segment(ls, 3, "cid-x", NULL) == 0,
+              "redeemed->issued regression fails closed");
+        free(r1);
+        free(r2);
+    }
+    /* Gate 6: an orphan receipt (no matching intent) fails startup closed */
+    {
+        char *r1 = mk_rcpt_line("cid-orphan", RAB_RCPT_ISSUED, 0, RS_V1,
+                                "apt.install");
+        char *ls[] = {r1};
+        CHECK(recon_segment(ls, 1, "cid-orphan", NULL) == 0,
+              "orphan receipt fails startup closed");
+        free(r1);
+    }
+    free(intent_line);
+}
+#undef RS_PH
+#undef RS_V1
+#undef RS_V2
 
 static void test_strict_parsing(void) {
     /* a well-formed intent record (baseline: must parse) */
@@ -1899,6 +2229,8 @@ int main(void) {
     test_record_schema();
     test_rate_record_parse();
     test_receipt_record();
+    test_receipt_state_machine();
+    test_receipt_reconstruction_conflicts();
     test_cross_sink_schema();
     test_strict_parsing();
     test_lifecycle_and_reconstruction();

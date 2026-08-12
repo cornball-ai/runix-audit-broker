@@ -1,6 +1,7 @@
 #include "broker.h"
 
 #include "id.h"
+#include "receipt.h"
 #include "record.h"
 #include "sink.h"
 
@@ -38,6 +39,20 @@ typedef struct intent {
     char operation[RAB_META_MAX]; /* retained so a checkpoint stays meaningful */
     char resource[RAB_META_MAX];
     char scope[RAB_SCOPE_MAX];
+    /* effect-receipt state; has_receipt == 0 for an ordinary intent (unchanged).
+     * Installed only after the broker_receipt record is durably appended. The
+     * verifier is the SHA-256 of the token in hex; the live token is never held. */
+    int has_receipt;
+    rab_rcpt_state rcpt_state;
+    char verifier_hex[RAB_HEX64_MAX];
+    uid_t rcpt_actor_uid;
+    char rcpt_verb[RAB_META_MAX];
+    char rcpt_resource[RAB_META_MAX];
+    long long rcpt_plan_schema;
+    char rcpt_plan_hash[RAB_HEX64_MAX];
+    unsigned long long rcpt_issue_boottime_us;
+    unsigned long long rcpt_ttl_us;
+    char rcpt_boot_id[RAB_BOOT_ID_MAX];
     struct intent *hcid;  /* chain in the by-cid table */
     struct intent *hbind; /* chain in the by-binding table */
 } intent;
@@ -78,6 +93,7 @@ struct rab_broker {
     unsigned long long g_win_bytes;
     unsigned long long seg_bytes;
     int poisoned; /* a partial append / fsync uncertainty: refuse until restart */
+    int test_fail_append; /* test seam: force the next append to tear (see hdr) */
 };
 
 void rab_config_defaults(rab_config *cfg) {
@@ -373,6 +389,12 @@ static int enough_free_space(rab_broker *b) {
  * bytes. */
 static int append_line(rab_broker *b, const char *line) {
     size_t len = strlen(line);
+    if (b->test_fail_append) {
+        /* simulate a torn write: poison exactly as a real append failure would */
+        b->test_fail_append = 0;
+        b->poisoned = 1;
+        return -1;
+    }
     if (rab_sink_append(b->fd, line, len) != 0) {
         b->poisoned = 1;
         return -1;
@@ -621,6 +643,26 @@ static int rotate(rab_broker *b) {
                 rc = -1;
             }
             free(line);
+            /* Carry the effect receipt as exactly one checkpoint per still-open
+             * effect-required intent, written right after its intent checkpoint
+             * so reconstruction sees the intent before its receipt. A checkpoint
+             * stands alone (it carries the full current state). */
+            if (rc == 0 && it->has_receipt) {
+                char *rl = rab_build_receipt(
+                    it->cid, it->rcpt_state, 1, it->verifier_hex,
+                    it->rcpt_actor_uid, it->rcpt_verb, it->rcpt_resource,
+                    it->rcpt_plan_schema, it->rcpt_plan_hash,
+                    it->rcpt_issue_boottime_us, it->rcpt_ttl_us,
+                    it->rcpt_boot_id);
+                if (rl == NULL) {
+                    rc = -1;
+                    break;
+                }
+                if (rab_sink_append(pfd, rl, strlen(rl)) != 0) {
+                    rc = -1;
+                }
+                free(rl);
+            }
         }
     }
     if (rc != 0) {
@@ -984,6 +1026,62 @@ static void cidset_free(cidset *s) {
     s->bkt = NULL;
 }
 
+/* Do a receipt record's bound identity fields match an intent's installed
+ * receipt? Used to tell an idempotent replay (equal) from a conflicting
+ * duplicate (differ). The verifier is part of the identity, so a re-minted
+ * receipt for the same cid conflicts. */
+static int receipt_bound_eq(const intent *it, const rab_stored *s) {
+    return it->rcpt_actor_uid == s->rcpt_actor_uid &&
+           it->rcpt_plan_schema == s->rcpt_plan_schema &&
+           it->rcpt_issue_boottime_us == s->rcpt_issue_boottime_us &&
+           it->rcpt_ttl_us == s->rcpt_ttl_us &&
+           strcmp(it->verifier_hex, s->rcpt_verifier) == 0 &&
+           strcmp(it->rcpt_verb, s->rcpt_verb) == 0 &&
+           strcmp(it->rcpt_resource, s->rcpt_resource) == 0 &&
+           strcmp(it->rcpt_plan_hash, s->rcpt_plan_hash) == 0 &&
+           strcmp(it->rcpt_boot_id, s->rcpt_boot_id) == 0;
+}
+
+/* Apply a reconstructed broker_receipt record to its already-open intent.
+ * First record: a `redeemed` TRANSITION with no prior `issued` is corruption
+ * (fail closed); a `redeemed` CHECKPOINT stands alone. Second record: the bound
+ * identity must match (a conflicting duplicate fails closed) and the state must
+ * be identical (idempotent replay) or a valid issued -> redeemed progression. */
+static const char *apply_receipt(intent *it, const rab_stored *s) {
+    if (!it->has_receipt) {
+        if (!s->rcpt_is_checkpoint && s->rcpt_state == RAB_RCPT_REDEEMED) {
+            return "redeemed receipt transition without a prior issued";
+        }
+        it->has_receipt = 1;
+        it->rcpt_state = s->rcpt_state;
+        it->rcpt_actor_uid = s->rcpt_actor_uid;
+        it->rcpt_plan_schema = s->rcpt_plan_schema;
+        it->rcpt_issue_boottime_us = s->rcpt_issue_boottime_us;
+        it->rcpt_ttl_us = s->rcpt_ttl_us;
+        snprintf(it->verifier_hex, sizeof it->verifier_hex, "%s",
+                 s->rcpt_verifier);
+        snprintf(it->rcpt_verb, sizeof it->rcpt_verb, "%s", s->rcpt_verb);
+        snprintf(it->rcpt_resource, sizeof it->rcpt_resource, "%s",
+                 s->rcpt_resource);
+        snprintf(it->rcpt_plan_hash, sizeof it->rcpt_plan_hash, "%s",
+                 s->rcpt_plan_hash);
+        snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s",
+                 s->rcpt_boot_id);
+        return NULL;
+    }
+    if (!receipt_bound_eq(it, s)) {
+        return "conflicting duplicate receipt";
+    }
+    if (s->rcpt_state == it->rcpt_state) {
+        return NULL; /* idempotent replay */
+    }
+    if (it->rcpt_state == RAB_RCPT_ISSUED && s->rcpt_state == RAB_RCPT_REDEEMED) {
+        it->rcpt_state = RAB_RCPT_REDEEMED;
+        return NULL;
+    }
+    return "inconsistent receipt state transition";
+}
+
 /* Apply one reconstructed record to the open-set. Returns NULL on success or a
  * static error string on an inconsistency (fail closed). */
 static const char *apply_stored(rab_broker *b, const rab_stored *s,
@@ -1032,6 +1130,20 @@ static const char *apply_stored(rab_broker *b, const rab_stored *s,
             return "out of memory during reconstruction";
         }
         return NULL;
+    }
+    if (s->type == RAB_REC_RECEIPT) {
+        /* A receipt associates to an already-reconstructed intent by cid. An
+         * orphan receipt (no matching open intent) fails startup closed rather
+         * than being ignored: a crash between the intent and receipt appends
+         * leaves an intent with NO receipt (safe: no authorization), never a
+         * receipt with no intent. */
+        intent *it = open_find_cid(b, s->correlation_id);
+        if (it == NULL) {
+            return cidset_has(closed, s->correlation_id)
+                       ? "receipt for a closed operation"
+                       : "orphan receipt without a matching intent";
+        }
+        return apply_receipt(it, s);
     }
     /* any other audit phase (e.g. a preview/noop emit) is a standalone closed
      * record: it opens nothing and is not an open/close event. */
@@ -1325,3 +1437,87 @@ int rab_broker_has_open(const rab_broker *b, const char *correlation_id) {
     }
     return 0;
 }
+
+/* ---- effect-receipt issuance ------------------------------------------- */
+
+/* lowercase-hex encode n bytes into out (2n+1 chars incl. NUL). */
+static void hex_encode(const unsigned char *in, size_t n, char *out) {
+    static const char h[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2 * i] = h[in[i] >> 4];
+        out[2 * i + 1] = h[in[i] & 0x0f];
+    }
+    out[2 * n] = '\0';
+}
+
+int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
+                             long long plan_schema, const char *plan_hash,
+                             unsigned long long issue_boottime_us,
+                             unsigned long long ttl_us, const char *boot_id,
+                             char *out_token, size_t out_cap) {
+    if (b->poisoned || out_token == NULL || out_cap < RAB_RECEIPT_MAX) {
+        return -1;
+    }
+    intent *it = open_find_cid(b, correlation_id);
+    if (it == NULL || it->has_receipt) {
+        return -1; /* no such open intent, or it already carries a receipt */
+    }
+    if (!enough_free_space(b)) {
+        return -1; /* transient refusal; not a poison */
+    }
+    char token[RAB_RECEIPT_MAX];
+    unsigned char vraw[RAB_SHA256_LEN];
+    char vhex[RAB_SHA256_HEX_MAX];
+    if (rab_make_receipt(token, sizeof token) != 0 ||
+        rab_sha256(token, strlen(token), vraw) != 0) {
+        return -1;
+    }
+    hex_encode(vraw, RAB_SHA256_LEN, vhex);
+    /* the receipt binds the intent's opener uid, verb (operation) and resource,
+     * plus the caller-supplied plan digest and the broker-assigned time/boot id */
+    char *line = rab_build_receipt(it->cid, RAB_RCPT_ISSUED, 0, vhex,
+                                   it->actor.uid, it->operation, it->resource,
+                                   plan_schema, plan_hash, issue_boottime_us,
+                                   ttl_us, boot_id);
+    if (line == NULL) {
+        return -1; /* invalid effect params (e.g. bad plan_hash): no effect */
+    }
+    /* Durable append + fdatasync FIRST. On failure the broker is poisoned and no
+     * in-memory state is installed and no token is returned (rules 4 and 5). */
+    if (append_line(b, line) != 0) {
+        free(line);
+        return -1;
+    }
+    free(line);
+    /* Install the in-memory receipt state only now that it is durable. */
+    it->has_receipt = 1;
+    it->rcpt_state = RAB_RCPT_ISSUED;
+    it->rcpt_actor_uid = it->actor.uid;
+    it->rcpt_plan_schema = plan_schema;
+    it->rcpt_issue_boottime_us = issue_boottime_us;
+    it->rcpt_ttl_us = ttl_us;
+    snprintf(it->verifier_hex, sizeof it->verifier_hex, "%s", vhex);
+    snprintf(it->rcpt_verb, sizeof it->rcpt_verb, "%s", it->operation);
+    snprintf(it->rcpt_resource, sizeof it->rcpt_resource, "%s", it->resource);
+    snprintf(it->rcpt_plan_hash, sizeof it->rcpt_plan_hash, "%s", plan_hash);
+    snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s", boot_id);
+    snprintf(out_token, out_cap, "%s", token);
+    return 0;
+}
+
+int rab_broker_receipt_state(const rab_broker *b, const char *correlation_id) {
+    for (intent *it = b->bkt_cid[hstr(correlation_id) & (b->nbkt - 1)];
+         it != NULL; it = it->hcid) {
+        if (strcmp(it->cid, correlation_id) == 0) {
+            if (!it->has_receipt) {
+                return -1;
+            }
+            return it->rcpt_state == RAB_RCPT_REDEEMED ? 1 : 0;
+        }
+    }
+    return -1;
+}
+
+int rab_broker_poisoned(const rab_broker *b) { return b->poisoned; }
+
+void rab_broker_test_fail_next_append(rab_broker *b) { b->test_fail_append = 1; }

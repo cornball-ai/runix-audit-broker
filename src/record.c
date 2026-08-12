@@ -212,7 +212,7 @@ char *rab_build_rate(uid_t uid, const unsigned long long *times,
 }
 
 char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
-                        const char *verifier_hex, uid_t actor_uid,
+                        int checkpoint, const char *verifier_hex, uid_t actor_uid,
                         const char *verb, const char *resource,
                         long long plan_schema, const char *plan_hash,
                         unsigned long long issue_boottime_us,
@@ -247,6 +247,8 @@ char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
                                json_integer(RAB_BROKER_STATE_SCHEMA_VERSION));
     bad |= json_object_set_new(root, "correlation_id",
                                json_string(correlation_id));
+    bad |= json_object_set_new(root, "checkpoint",
+                               checkpoint ? json_true() : json_false());
     bad |= json_object_set_new(
         root, "state",
         json_string(state == RAB_RCPT_REDEEMED ? "redeemed" : "issued"));
@@ -467,12 +469,12 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
          * carries only the SHA-256 verifier, never the token. Validated exactly
          * and in full here; any missing/extra/malformed field fails closed. */
         static const char *const rk[] = {
-            "schema_version",   "record_type", "state_schema_version",
-            "correlation_id",   "state",       "verifier",
-            "actor_uid",        "verb",        "resource",
-            "plan_schema",      "plan_hash",   "issue_boottime_us",
-            "ttl_us",           "boot_id"};
-        if (!obj_only_keys(root, rk, 14)) {
+            "schema_version",   "record_type",  "state_schema_version",
+            "correlation_id",   "checkpoint",   "state",
+            "verifier",         "actor_uid",    "verb",
+            "resource",         "plan_schema",  "plan_hash",
+            "issue_boottime_us", "ttl_us",      "boot_id"};
+        if (!obj_only_keys(root, rk, 15)) {
             goto done;
         }
         json_t *ssv = json_object_get(root, "state_schema_version");
@@ -486,6 +488,11 @@ int rab_parse_stored(const char *line, size_t len, rab_stored *out) {
                          json_string_value(jcid)) != 0) {
             goto done;
         }
+        json_t *jckpt = json_object_get(root, "checkpoint");
+        if (!json_is_boolean(jckpt)) {
+            goto done;
+        }
+        out->rcpt_is_checkpoint = json_is_true(jckpt) ? 1 : 0;
         json_t *jstate = json_object_get(root, "state");
         if (!json_is_string(jstate)) {
             goto done;

@@ -83,11 +83,12 @@ build-broker-asan: $(BROKER_SRC)
 
 # Socket-level tests: exec the ASan broker and drive it over AF_UNIX (slowloris,
 # concurrency, disconnect durability, connection limits). Built with ASan/UBSan.
-test-socket: build-broker-asan src/broker.c src/record.c src/json.c $(CORE) \
-             tests/test_socket.c
-	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) \
+test-socket: build-broker-asan src/broker.c src/record.c src/json.c \
+             src/receipt.c $(CORE) tests/test_socket.c
+	$(CC) $(CPPFLAGS) -std=c11 $(WARN) $(JSON_CFLAGS) $(CRYPTO_CFLAGS) \
 	    -fsanitize=address,undefined -g src/broker.c src/record.c src/json.c \
-	    $(CORE) tests/test_socket.c -o build-test-socket $(JSON_LIBS)
+	    src/receipt.c $(CORE) tests/test_socket.c -o build-test-socket \
+	    $(JSON_LIBS) $(CRYPTO_LIBS)
 	RAB_BROKER_BIN=./build-broker-asan ./build-test-socket
 
 # Cross-repo fixture cross-check: the broker's response builders + frame reader

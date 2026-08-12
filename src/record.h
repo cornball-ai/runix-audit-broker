@@ -79,11 +79,13 @@ char *rab_build_rate(uid_t uid, const unsigned long long *times,
  * to an open intent's `correlation_id`. It carries the SHA-256 `verifier` of the
  * receipt token (NEVER the live token), the bound {actor_uid, verb, resource,
  * plan_schema, plan_hash}, the CLOCK_BOOTTIME issue time + TTL, and the boot id.
- * `state` is RAB_RCPT_ISSUED or RAB_RCPT_REDEEMED. Written at issue/redeem and,
- * on rotation, as a carry-forward for every still-open intent. Returns a
- * malloc'd line or NULL. */
+ * `state` is RAB_RCPT_ISSUED or RAB_RCPT_REDEEMED. `checkpoint` marks a
+ * rotation carry-forward (the full current state, which stands alone on
+ * reconstruction) versus a transition record (a delta: a `redeemed` transition
+ * requires a prior `issued`). Returns a malloc'd line or NULL (also NULL if any
+ * input is invalid: the builder is as strict as rab_parse_stored). */
 char *rab_build_receipt(const char *correlation_id, rab_rcpt_state state,
-                        const char *verifier_hex, uid_t actor_uid,
+                        int checkpoint, const char *verifier_hex, uid_t actor_uid,
                         const char *verb, const char *resource,
                         long long plan_schema, const char *plan_hash,
                         unsigned long long issue_boottime_us,
@@ -116,6 +118,7 @@ typedef struct {
     size_t rate_n;
     /* RAB_REC_RECEIPT only (correlation_id above is the bound intent's cid). */
     rab_rcpt_state rcpt_state;
+    int rcpt_is_checkpoint; /* 1 = rotation carry (stands alone), 0 = transition */
     char rcpt_verifier[RAB_HEX64_MAX];
     uid_t rcpt_actor_uid; /* range-checked at parse; never a truncating cast */
     char rcpt_verb[RAB_META_MAX];
