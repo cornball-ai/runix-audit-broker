@@ -86,6 +86,45 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
                              long long plan_schema, const char *plan_hash,
                              char *out_token, size_t out_cap);
 
+/* Outcome of a redemption attempt. Every value but RAB_REDEEM_OK is a
+ * fail-closed refusal that leaves the receipt untouched; the wire redeem path
+ * (a later slice) maps these to typed protocol errors, but the primitive itself
+ * performs every identity/crypto/expiry check. */
+typedef enum {
+    RAB_REDEEM_OK = 0,       /* redeemed: state advanced to redeemed, durable */
+    RAB_REDEEM_UNKNOWN,      /* no such open intent, or it carries no receipt */
+    RAB_REDEEM_NOT_REDEEMER, /* the redeemer is not the root helper (uid 0) */
+    RAB_REDEEM_PRINCIPAL,    /* PKEXEC principal != the intent's bound opener uid */
+    RAB_REDEEM_TOKEN,        /* the presented token's verifier does not match */
+    RAB_REDEEM_BINDING,      /* verb/resource/plan_schema/plan_hash disagree */
+    RAB_REDEEM_EXPIRED,      /* the TTL elapsed, or a reboot invalidated it */
+    RAB_REDEEM_ALREADY,      /* already redeemed (single-use) */
+    RAB_REDEEM_PERSIST       /* poisoned, no free space, or a durable-append fault */
+} rab_redeem_result;
+
+/* Redeem the effect receipt bound to an open intent (by correlation_id): the
+ * state transition the root helper performs BEFORE it commits the effect. The
+ * redeemer must be uid 0 (the pkexec'd helper) and `principal_uid` (its
+ * PKEXEC_UID) must equal the intent's bound opener uid. The presented `token`'s
+ * SHA-256 is compared against the stored verifier in constant time
+ * (CRYPTO_memcmp on the raw digests, never a byte-early strcmp of the hex), and
+ * the presented {verb, resource, plan_schema, plan_hash} must equal the bound
+ * ones. The receipt must be unexpired: the current boot id equals the issue-time
+ * boot id AND the elapsed CLOCK_BOOTTIME is within the receipt's TTL. On success
+ * the redeemed transition is durably appended (fsync) BEFORE the in-memory state
+ * advances to redeemed, and RAB_REDEEM_OK is returned; a durable-append fault
+ * poisons the broker (RAB_REDEEM_PERSIST) and leaves the state issued. Redeeming
+ * is single-use: a second attempt is RAB_REDEEM_ALREADY. This is the state
+ * primitive the wire redeem path will call once wired; the wire does not reach
+ * it in this slice. */
+rab_redeem_result rab_broker_redeem_receipt(rab_broker *b,
+                                            const char *correlation_id,
+                                            const char *token, uid_t redeemer_uid,
+                                            uid_t principal_uid, const char *verb,
+                                            const char *resource,
+                                            long long plan_schema,
+                                            const char *plan_hash);
+
 /* Inspection for tests. */
 size_t rab_broker_open_count(const rab_broker *b);
 int rab_broker_has_open(const rab_broker *b, const char *correlation_id);

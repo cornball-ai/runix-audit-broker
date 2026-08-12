@@ -894,6 +894,21 @@ static int handle_outcome(rab_broker *b, const rab_actor *actor,
                                "actor_mismatch",
                                "peer identity does not match the opener"));
     }
+    /* Effect-receipt gate: an outcome that ASSERTS an effect was issued
+     * (effect_issued: true) on an effect-required intent is valid only once the
+     * intent's receipt has been REDEEMED through the root helper. An issued-but-
+     * unredeemed (or pending) receipt cannot back an effect claim -- that effect
+     * would have happened outside the sanctioned path. A non-effect outcome
+     * (abort/noop) is unaffected, and an ordinary intent (which carries no
+     * receipt) is entirely unaffected, so this changes nothing for today's
+     * clients. Reachable on the wire only once issuance is wired in (a later
+     * slice); until then no conforming client can open a receipt-bearing intent. */
+    if (it->has_receipt && it->rcpt_state != RAB_RCPT_REDEEMED &&
+        json_is_true(json_object_get(req->record, "effect_issued"))) {
+        return reply(resp, rab_response_error(
+                               "effect_without_receipt",
+                               "effect claimed without a redeemed receipt"));
+    }
     if (!enough_free_space(b)) {
         return reply(resp, rab_response_error("persist_failed",
                                               "insufficient free space"));
@@ -1523,6 +1538,33 @@ static void hex_encode(const unsigned char *in, size_t n, char *out) {
     out[2 * n] = '\0';
 }
 
+/* value of one lowercase-hex digit, or -1 if it is not one. */
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return -1;
+}
+
+/* Decode exactly 2*n lowercase-hex chars at `in` into out[n]. Returns 0 on
+ * success, -1 if any of the 2*n chars is not lowercase hex. Used to turn the
+ * stored hex verifier back into a raw digest so the redeem-time comparison can
+ * run in constant time on the raw bytes. */
+static int hex_decode(const char *in, size_t n, unsigned char *out) {
+    for (size_t i = 0; i < n; i++) {
+        int hi = hexval(in[2 * i]);
+        int lo = hexval(in[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return -1;
+        }
+        out[i] = (unsigned char) ((hi << 4) | lo);
+    }
+    return 0;
+}
+
 int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
                              long long plan_schema, const char *plan_hash,
                              char *out_token, size_t out_cap) {
@@ -1594,6 +1636,105 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
     explicit_bzero(token, sizeof token);
     explicit_bzero(vraw, sizeof vraw);
     return rc;
+}
+
+/* ---- effect-receipt redemption ----------------------------------------- */
+
+rab_redeem_result rab_broker_redeem_receipt(rab_broker *b,
+                                            const char *correlation_id,
+                                            const char *token, uid_t redeemer_uid,
+                                            uid_t principal_uid, const char *verb,
+                                            const char *resource,
+                                            long long plan_schema,
+                                            const char *plan_hash) {
+    if (b->poisoned) {
+        return RAB_REDEEM_PERSIST;
+    }
+    /* Only the root helper may redeem at all. This is the kernel-verified peer
+     * uid in production; a non-root redeemer never authorizes an effect. */
+    if (redeemer_uid != 0) {
+        return RAB_REDEEM_NOT_REDEEMER;
+    }
+    if (correlation_id == NULL || token == NULL) {
+        return RAB_REDEEM_UNKNOWN;
+    }
+    intent *it = open_find_cid(b, correlation_id);
+    if (it == NULL || !it->has_receipt) {
+        return RAB_REDEEM_UNKNOWN;
+    }
+    /* The pkexec principal must be the intent's bound opener: root acts on behalf
+     * of exactly the uid that opened the intent, so the audit stays coherent. */
+    if (principal_uid != it->rcpt_actor_uid) {
+        return RAB_REDEEM_PRINCIPAL;
+    }
+    /* Constant-time verifier check: hash the presented token, decode the stored
+     * hex verifier back to a raw digest, and CRYPTO_memcmp. The hex is never
+     * strcmp'd (that would leak the first-differing position via early exit). */
+    {
+        unsigned char presented[RAB_SHA256_LEN];
+        unsigned char stored[RAB_SHA256_LEN];
+        int match = rab_sha256(token, strlen(token), presented) == 0 &&
+                    strlen(it->verifier_hex) == RAB_SHA256_LEN * 2 &&
+                    hex_decode(it->verifier_hex, RAB_SHA256_LEN, stored) == 0 &&
+                    rab_sha256_eq(presented, stored) == 1;
+        explicit_bzero(presented, sizeof presented);
+        explicit_bzero(stored, sizeof stored);
+        if (!match) {
+            return RAB_REDEEM_TOKEN;
+        }
+    }
+    /* The presented plan must equal the plan bound at issue. */
+    if (verb == NULL || resource == NULL || plan_hash == NULL ||
+        plan_schema != it->rcpt_plan_schema ||
+        strcmp(verb, it->rcpt_verb) != 0 ||
+        strcmp(resource, it->rcpt_resource) != 0 ||
+        strcmp(plan_hash, it->rcpt_plan_hash) != 0) {
+        return RAB_REDEEM_BINDING;
+    }
+    /* Single-use: an already-redeemed receipt cannot authorize a second effect.
+     * Checked only after identity + token + plan are proven, so the redeemed
+     * state is disclosed only to the legitimate holder. */
+    if (it->rcpt_state == RAB_RCPT_REDEEMED) {
+        return RAB_REDEEM_ALREADY;
+    }
+    /* Unexpired: the current boot id must equal the issue-time boot id (a reboot
+     * resets CLOCK_BOOTTIME, so a receipt from a prior boot is dead) AND the
+     * elapsed boot time must be within the TTL. A clock or boot-id read failure
+     * cannot establish validity, so it fails closed as expired. */
+    {
+        unsigned long long now_us = 0;
+        char cur_boot[RAB_BOOT_ID_MAX];
+        if (b->boottime(b->rcpt_ctx, &now_us) != 0 ||
+            b->bootid(b->rcpt_ctx, cur_boot, sizeof cur_boot) != 0) {
+            return RAB_REDEEM_EXPIRED;
+        }
+        if (strcmp(cur_boot, it->rcpt_boot_id) != 0 ||
+            now_us < it->rcpt_issue_boottime_us ||
+            now_us - it->rcpt_issue_boottime_us > it->rcpt_ttl_us) {
+            return RAB_REDEEM_EXPIRED;
+        }
+    }
+    if (!enough_free_space(b)) {
+        return RAB_REDEEM_PERSIST; /* transient refusal; not a poison */
+    }
+    /* Durably append the redeemed TRANSITION (checkpoint=0), carrying the SAME
+     * bound identity, verifier, issue time, TTL, and boot id as the issued
+     * record, then advance the in-memory state ONLY after the append+fsync
+     * succeeds. An append fault poisons the broker and leaves the state issued. */
+    char *line = rab_build_receipt(
+        it->cid, RAB_RCPT_REDEEMED, 0, it->verifier_hex, it->rcpt_actor_uid,
+        it->rcpt_verb, it->rcpt_resource, it->rcpt_plan_schema, it->rcpt_plan_hash,
+        it->rcpt_issue_boottime_us, it->rcpt_ttl_us, it->rcpt_boot_id);
+    if (line == NULL) {
+        return RAB_REDEEM_PERSIST;
+    }
+    int arc = append_line(b, line);
+    free(line);
+    if (arc != 0) {
+        return RAB_REDEEM_PERSIST; /* append_line already poisoned */
+    }
+    it->rcpt_state = RAB_RCPT_REDEEMED;
+    return RAB_REDEEM_OK;
 }
 
 int rab_broker_receipt_state(const rab_broker *b, const char *correlation_id) {
