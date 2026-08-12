@@ -466,10 +466,13 @@ char *rab_response_capabilities(void) {
     json_object_set_new(o, "frame_version", json_integer(RAB_PROTO_VERSION));
     json_object_set_new(o, "record_schema_version",
                         json_integer(RAB_RECORD_SCHEMA_VERSION));
-    /* effect_receipt is advertised (and plan_schemas populated) only once the
-     * broker actually honours redemption; until then the map is empty so a
-     * client never assumes a capability the broker cannot back. */
+    /* The effect-receipt capability is honoured: issuance, redemption,
+     * persistence, and reconstruction are all backed, so it is advertised here
+     * with the single plan-digest schema the broker offers. */
+    json_object_set_new(ext, "effect_receipt",
+                        json_integer(RAB_EFFECT_RECEIPT_VERSION));
     json_object_set_new(o, "extensions", ext);
+    json_array_append_new(schemas, json_integer(RAB_PLAN_SCHEMA_V1));
     json_object_set_new(o, "plan_schemas", schemas);
     return dump_compact(o);
 }

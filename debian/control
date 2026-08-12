@@ -15,8 +15,8 @@ Description: privileged audit broker for the Runix durable-audit system
  audit record to the root-owned Runix system sink on behalf of an
  unprivileged caller. The caller is identified by SO_PEERCRED (never by the
  payload); the broker performs no mutations and exposes a small set of request
- types (open_intent, write_outcome, emit, capabilities) over a local AF_UNIX
- socket, framed and parsed strictly.
+ types (open_intent, write_outcome, emit, redeem_receipt, capabilities) over a
+ local AF_UNIX socket, framed and parsed strictly.
  .
  It is the "strong" resolution of the Runix durable-audit authority matrix:
  the component that lets an unprivileged system-scope mutation obtain a

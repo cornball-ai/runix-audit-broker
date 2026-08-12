@@ -380,8 +380,8 @@ int main(void) {
         free(r);
         r = rab_response_capabilities();
         CHECK(r != NULL && strcmp(r,
-            "{\"extensions\":{},\"frame_version\":1,\"ok\":true,"
-            "\"plan_schemas\":[],\"record_schema_version\":1}") == 0,
+            "{\"extensions\":{\"effect_receipt\":1},\"frame_version\":1,"
+            "\"ok\":true,\"plan_schemas\":[1],\"record_schema_version\":1}") == 0,
             "capabilities golden bytes");
         free(r);
         r = rab_response_error("schema_invalid", "nope");

@@ -19,6 +19,12 @@
 #define RAB_RECEIPT_TOKEN_MAX 33 /* 32-hex receipt token (128-bit) + NUL */
 #define RAB_REDEEM_STR_MAX 128   /* redeem effect verb/resource bound */
 
+/* The effect-receipt capability, now honoured: the wire extension version
+ * advertised as extensions.effect_receipt, and the one plan-digest schema the
+ * broker offers in plan_schemas. */
+#define RAB_EFFECT_RECEIPT_VERSION 1
+#define RAB_PLAN_SCHEMA_V1 1
+
 typedef enum {
     RAB_REQ_OPEN_INTENT,
     RAB_REQ_WRITE_OUTCOME,
