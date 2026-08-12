@@ -39,6 +39,7 @@ typedef struct intent {
     char operation[RAB_META_MAX]; /* retained so a checkpoint stays meaningful */
     char resource[RAB_META_MAX];
     char scope[RAB_SCOPE_MAX];
+    int from_checkpoint; /* opened via a broker_checkpoint (rotation carry)? */
     /* effect-receipt state; has_receipt == 0 for an ordinary intent (unchanged).
      * Installed only after the broker_receipt record is durably appended. The
      * verifier is the SHA-256 of the token in hex; the live token is never held. */
@@ -93,7 +94,11 @@ struct rab_broker {
     unsigned long long g_win_bytes;
     unsigned long long seg_bytes;
     int poisoned; /* a partial append / fsync uncertainty: refuse until restart */
-    int test_fail_append; /* test seam: force the next append to tear (see hdr) */
+    /* effect-receipt issue time / boot id sources (broker-owned; injectable). */
+    rab_boottime_fn boottime;
+    rab_bootid_fn bootid;
+    void *rcpt_ctx;
+    rab_test_fail_mode test_fail; /* test seam: force the next append to fail */
 };
 
 void rab_config_defaults(rab_config *cfg) {
@@ -107,6 +112,7 @@ void rab_config_defaults(rab_config *cfg) {
     cfg->min_free_bytes = 64ull << 20;  /* refuse appends below 64 MiB free */
     cfg->retain_segments = 16;          /* keep at most 16 archived segments */
     cfg->retain_bytes = 1024ull << 20;  /* and at most 1 GiB total on disk */
+    cfg->receipt_ttl_sec = 300;         /* effect-receipt validity: 5 minutes */
 }
 
 static unsigned long long real_clock(void *ctx) {
@@ -117,6 +123,25 @@ static unsigned long long real_clock(void *ctx) {
     }
     return (unsigned long long) ts.tv_sec * 1000000ull +
            (unsigned long long) (ts.tv_nsec / 1000);
+}
+
+/* Default receipt issue-time source: CLOCK_BOOTTIME (counts across suspend,
+ * resets across reboot), microseconds. Fails closed if the clock is unreadable. */
+static int real_boottime(void *ctx, unsigned long long *out) {
+    (void) ctx;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) {
+        return -1;
+    }
+    *out = (unsigned long long) ts.tv_sec * 1000000ull +
+           (unsigned long long) (ts.tv_nsec / 1000);
+    return 0;
+}
+
+/* Default boot-id provider: the host boot id. Fails closed if unreadable. */
+static int real_bootid(void *ctx, char *out, size_t cap) {
+    (void) ctx;
+    return rab_boot_id(out, cap);
 }
 
 /* ---- hashing ----------------------------------------------------------- */
@@ -389,9 +414,22 @@ static int enough_free_space(rab_broker *b) {
  * bytes. */
 static int append_line(rab_broker *b, const char *line) {
     size_t len = strlen(line);
-    if (b->test_fail_append) {
-        /* simulate a torn write: poison exactly as a real append failure would */
-        b->test_fail_append = 0;
+    if (b->test_fail != RAB_FAIL_NONE) {
+        /* Exercise the sink append/sync boundary: RAB_FAIL_PARTIAL leaves a
+         * torn partial record on disk (recovered by truncation at restart);
+         * RAB_FAIL_SYNC writes a complete record whose fdatasync is treated as
+         * failed (durability uncertain). Either way the broker is poisoned. */
+        rab_test_fail_mode mode = b->test_fail;
+        b->test_fail = RAB_FAIL_NONE;
+        if (mode == RAB_FAIL_PARTIAL && len > 1) {
+            ssize_t w = write(b->fd, line, len / 2);
+            (void) w;
+        } else if (mode == RAB_FAIL_SYNC) {
+            ssize_t w1 = write(b->fd, line, len);
+            ssize_t w2 = write(b->fd, "\n", 1);
+            (void) w1;
+            (void) w2;
+        }
         b->poisoned = 1;
         return -1;
     }
@@ -1048,6 +1086,18 @@ static int receipt_bound_eq(const intent *it, const rab_stored *s) {
  * identity must match (a conflicting duplicate fails closed) and the state must
  * be identical (idempotent replay) or a valid issued -> redeemed progression. */
 static const char *apply_receipt(intent *it, const rab_stored *s) {
+    /* the receipt's bound identity must match its parent intent: a receipt whose
+     * actor/verb/resource disagrees with the intent it names is corruption. */
+    if (s->rcpt_actor_uid != it->actor.uid ||
+        strcmp(s->rcpt_verb, it->operation) != 0 ||
+        strcmp(s->rcpt_resource, it->resource) != 0) {
+        return "receipt bound fields inconsistent with its intent";
+    }
+    /* a receipt checkpoint only arises from rotation, which also carries the
+     * intent as a checkpoint; it can never pair with a raw audit intent. */
+    if (s->rcpt_is_checkpoint && !it->from_checkpoint) {
+        return "receipt checkpoint beside a non-checkpoint intent";
+    }
     if (!it->has_receipt) {
         if (!s->rcpt_is_checkpoint && s->rcpt_state == RAB_RCPT_REDEEMED) {
             return "redeemed receipt transition without a prior issued";
@@ -1114,6 +1164,14 @@ static const char *apply_stored(rab_broker *b, const rab_stored *s,
         if (open_add(b, s->correlation_id, s->binding, &s->actor, s->operation,
                      s->resource, s->scope) != 0) {
             return "out of memory during reconstruction";
+        }
+        if (is_checkpoint) {
+            /* remember the intent came from a rotation carry, so a receipt
+             * checkpoint (which also only comes from rotation) may pair with it. */
+            intent *ni = open_find_cid(b, s->correlation_id);
+            if (ni != NULL) {
+                ni->from_checkpoint = 1;
+            }
         }
         return NULL;
     }
@@ -1343,8 +1401,23 @@ rab_broker *rab_broker_open(const char *path, const rab_config *cfg,
         free(b);
         return NULL;
     }
+    /* The receipt TTL is a fixed, bounded config value: zero (instantly expired)
+     * and an out-of-range value are refused rather than run, so issuance never
+     * computes a nonsensical or overflowing expiry. */
+    if (b->cfg.receipt_ttl_sec == 0 ||
+        b->cfg.receipt_ttl_sec > RAB_MAX_RECEIPT_TTL_SEC) {
+        *err = "receipt_ttl_sec must be in (0, RAB_MAX_RECEIPT_TTL_SEC]";
+        free(b->path);
+        free(b);
+        return NULL;
+    }
     b->clock = clock ? clock : real_clock;
     b->clock_ctx = ctx;
+    /* effect-receipt time/boot-id sources default to the real ones; a test may
+     * override them via rab_broker_test_set_receipt_time. */
+    b->boottime = real_boottime;
+    b->bootid = real_bootid;
+    b->rcpt_ctx = NULL;
     if (gethostname(b->host, sizeof b->host) != 0) {
         b->host[0] = '\0';
     }
@@ -1452,9 +1525,12 @@ static void hex_encode(const unsigned char *in, size_t n, char *out) {
 
 int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
                              long long plan_schema, const char *plan_hash,
-                             unsigned long long issue_boottime_us,
-                             unsigned long long ttl_us, const char *boot_id,
                              char *out_token, size_t out_cap) {
+    /* Clear the caller's token buffer up front so EVERY failure path (and the
+     * success path before the copy) leaves it empty, never stale data. */
+    if (out_token != NULL && out_cap > 0) {
+        out_token[0] = '\0';
+    }
     if (b->poisoned || out_token == NULL || out_cap < RAB_RECEIPT_MAX) {
         return -1;
     }
@@ -1465,44 +1541,59 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
     if (!enough_free_space(b)) {
         return -1; /* transient refusal; not a poison */
     }
+    /* Broker-owned issue time, boot id, and TTL (never client-supplied). A
+     * clock or boot-id failure fails issuance closed. */
+    unsigned long long issue_boottime_us = 0;
+    char boot_id[RAB_BOOT_ID_MAX];
+    if (b->boottime(b->rcpt_ctx, &issue_boottime_us) != 0 ||
+        b->bootid(b->rcpt_ctx, boot_id, sizeof boot_id) != 0) {
+        return -1;
+    }
+    /* receipt_ttl_sec is bounded at open (0 < ttl <= RAB_MAX_RECEIPT_TTL_SEC),
+     * so this product cannot overflow a 64-bit microsecond counter. */
+    unsigned long long ttl_us =
+        (unsigned long long) b->cfg.receipt_ttl_sec * 1000000ull;
     char token[RAB_RECEIPT_MAX];
     unsigned char vraw[RAB_SHA256_LEN];
     char vhex[RAB_SHA256_HEX_MAX];
     if (rab_make_receipt(token, sizeof token) != 0 ||
         rab_sha256(token, strlen(token), vraw) != 0) {
+        explicit_bzero(token, sizeof token);
+        explicit_bzero(vraw, sizeof vraw);
         return -1;
     }
     hex_encode(vraw, RAB_SHA256_LEN, vhex);
-    /* the receipt binds the intent's opener uid, verb (operation) and resource,
-     * plus the caller-supplied plan digest and the broker-assigned time/boot id */
+    /* binds the intent's opener uid, verb (operation) and resource, plus the
+     * caller's plan digest and the broker-assigned time/boot id */
     char *line = rab_build_receipt(it->cid, RAB_RCPT_ISSUED, 0, vhex,
                                    it->actor.uid, it->operation, it->resource,
                                    plan_schema, plan_hash, issue_boottime_us,
                                    ttl_us, boot_id);
-    if (line == NULL) {
-        return -1; /* invalid effect params (e.g. bad plan_hash): no effect */
+    int rc = -1;
+    if (line != NULL && append_line(b, line) == 0) {
+        /* Durable append + fdatasync succeeded: install the in-memory state
+         * only now (never before durability), and hand back the token. */
+        it->has_receipt = 1;
+        it->rcpt_state = RAB_RCPT_ISSUED;
+        it->rcpt_actor_uid = it->actor.uid;
+        it->rcpt_plan_schema = plan_schema;
+        it->rcpt_issue_boottime_us = issue_boottime_us;
+        it->rcpt_ttl_us = ttl_us;
+        snprintf(it->verifier_hex, sizeof it->verifier_hex, "%s", vhex);
+        snprintf(it->rcpt_verb, sizeof it->rcpt_verb, "%s", it->operation);
+        snprintf(it->rcpt_resource, sizeof it->rcpt_resource, "%s",
+                 it->resource);
+        snprintf(it->rcpt_plan_hash, sizeof it->rcpt_plan_hash, "%s", plan_hash);
+        snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s", boot_id);
+        snprintf(out_token, out_cap, "%s", token);
+        rc = 0;
     }
-    /* Durable append + fdatasync FIRST. On failure the broker is poisoned and no
-     * in-memory state is installed and no token is returned (rules 4 and 5). */
-    if (append_line(b, line) != 0) {
-        free(line);
-        return -1;
-    }
+    /* line == NULL: invalid effect params (e.g. bad plan_hash) -> no effect.
+     * append failure: append_line already poisoned; out_token stays cleared. */
     free(line);
-    /* Install the in-memory receipt state only now that it is durable. */
-    it->has_receipt = 1;
-    it->rcpt_state = RAB_RCPT_ISSUED;
-    it->rcpt_actor_uid = it->actor.uid;
-    it->rcpt_plan_schema = plan_schema;
-    it->rcpt_issue_boottime_us = issue_boottime_us;
-    it->rcpt_ttl_us = ttl_us;
-    snprintf(it->verifier_hex, sizeof it->verifier_hex, "%s", vhex);
-    snprintf(it->rcpt_verb, sizeof it->rcpt_verb, "%s", it->operation);
-    snprintf(it->rcpt_resource, sizeof it->rcpt_resource, "%s", it->resource);
-    snprintf(it->rcpt_plan_hash, sizeof it->rcpt_plan_hash, "%s", plan_hash);
-    snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s", boot_id);
-    snprintf(out_token, out_cap, "%s", token);
-    return 0;
+    explicit_bzero(token, sizeof token);
+    explicit_bzero(vraw, sizeof vraw);
+    return rc;
 }
 
 int rab_broker_receipt_state(const rab_broker *b, const char *correlation_id) {
@@ -1520,4 +1611,13 @@ int rab_broker_receipt_state(const rab_broker *b, const char *correlation_id) {
 
 int rab_broker_poisoned(const rab_broker *b) { return b->poisoned; }
 
-void rab_broker_test_fail_next_append(rab_broker *b) { b->test_fail_append = 1; }
+void rab_broker_test_fail_next_append(rab_broker *b, rab_test_fail_mode mode) {
+    b->test_fail = mode;
+}
+
+void rab_broker_test_set_receipt_time(rab_broker *b, rab_boottime_fn bt,
+                                      rab_bootid_fn bid, void *ctx) {
+    b->boottime = bt ? bt : real_boottime;
+    b->bootid = bid ? bid : real_bootid;
+    b->rcpt_ctx = ctx;
+}

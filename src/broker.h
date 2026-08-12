@@ -22,7 +22,12 @@ typedef struct {
     unsigned long long min_free_bytes; /* refuse appends below this fs free (0=off) */
     unsigned retain_segments;        /* max archived segments to keep (0=unlimited) */
     unsigned long long retain_bytes; /* max total bytes, active+archives (0=unlimited) */
+    unsigned receipt_ttl_sec;        /* effect-receipt TTL, seconds (fixed, bounded) */
 } rab_config;
+
+/* Upper bound on the receipt TTL (30 days): keeps issue_boottime + ttl well
+ * inside a 64-bit microsecond counter and rejects a nonsensical config. */
+#define RAB_MAX_RECEIPT_TTL_SEC (30u * 24u * 60u * 60u)
 
 void rab_config_defaults(rab_config *cfg);
 
@@ -31,6 +36,20 @@ typedef struct rab_broker rab_broker;
 /* Injectable microsecond wall clock (broker-assigned timestamps; the rate
  * window must survive a restart, so this is real time, not monotonic). */
 typedef unsigned long long (*rab_clock_fn)(void *ctx);
+
+/* Injectable CLOCK_BOOTTIME microsecond source and boot-id provider for
+ * effect-receipt issuance. Both return 0 on success (writing the result) and -1
+ * on failure, which fails issuance closed. The broker owns the receipt's issue
+ * time, TTL, and boot id structurally; a client never supplies them. */
+typedef int (*rab_boottime_fn)(void *ctx, unsigned long long *out_us);
+typedef int (*rab_bootid_fn)(void *ctx, char *out, size_t cap);
+
+/* Durability-failure injection mode for the append test seam. */
+typedef enum {
+    RAB_FAIL_NONE = 0,
+    RAB_FAIL_PARTIAL, /* a torn write: partial bytes land, then the append fails */
+    RAB_FAIL_SYNC     /* a complete record written, then the fdatasync fails */
+} rab_test_fail_mode;
 
 /* Open (creating if absent) the sink at `path`, reconstruct the open-intent set
  * and per-uid rate state from it, and return a ready broker. Fails closed
@@ -59,13 +78,12 @@ int rab_broker_handle(rab_broker *b, const rab_actor *actor,
  * closed, already-receipted intent, or low free space returns -1 without
  * poisoning. The receipt binds the intent's opener uid, verb (operation) and
  * resource, plus the caller-supplied plan digest and broker-assigned
- * CLOCK_BOOTTIME issue time / TTL / boot id. This is the state primitive the
- * redemption work (2c) and the public effect path will call once wired; the
- * wire path does not reach it in this slice. */
+ * CLOCK_BOOTTIME issue time (broker-derived), the fixed config TTL, and the
+ * broker's boot id. This is the state primitive the redemption work (2c) and
+ * the public effect path will call once wired; the wire path does not reach it
+ * in this slice. `out_token` is cleared to "" on every failure path. */
 int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
                              long long plan_schema, const char *plan_hash,
-                             unsigned long long issue_boottime_us,
-                             unsigned long long ttl_us, const char *boot_id,
                              char *out_token, size_t out_cap);
 
 /* Inspection for tests. */
@@ -75,8 +93,14 @@ int rab_broker_has_open(const rab_broker *b, const char *correlation_id);
 int rab_broker_receipt_state(const rab_broker *b, const char *correlation_id);
 int rab_broker_poisoned(const rab_broker *b);
 
-/* Test seam: force the NEXT sink append to fail as if the write tore, so the
- * poison-on-append-failure path is exercised deterministically. */
-void rab_broker_test_fail_next_append(rab_broker *b);
+/* Test seam: force the NEXT sink append to fail at the sink append/sync
+ * boundary (partial write, or fdatasync-after-write), exercising the
+ * poison-on-durability-failure path deterministically. */
+void rab_broker_test_fail_next_append(rab_broker *b, rab_test_fail_mode mode);
+
+/* Test seam: override the receipt CLOCK_BOOTTIME / boot-id sources (and ctx).
+ * Passing NULL for a source restores the real one. */
+void rab_broker_test_set_receipt_time(rab_broker *b, rab_boottime_fn bt,
+                                      rab_bootid_fn bid, void *ctx);
 
 #endif /* RAB_BROKER_H */
