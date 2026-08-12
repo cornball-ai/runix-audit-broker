@@ -174,8 +174,10 @@ static int effect_valid(json_t *e) {
     json_t *req = json_object_get(e, "required");
     json_t *ps = json_object_get(e, "plan_schema");
     json_t *ph = json_object_get(e, "plan_hash");
+    /* plan_schema must be a schema this broker actually offers (advertised in
+     * capabilities.plan_schemas); an unadvertised one is refused, not bound. */
     if (!json_is_true(req) || !json_is_integer(ps) ||
-        json_integer_value(ps) < 1 || !json_is_string(ph)) {
+        json_integer_value(ps) != RAB_PLAN_SCHEMA_V1 || !json_is_string(ph)) {
         return 0;
     }
     return is_hex64(json_string_value(ph));
@@ -201,8 +203,8 @@ static int redeem_effect_valid(json_t *e) {
     json_t *ps = json_object_get(e, "plan_schema");
     json_t *ph = json_object_get(e, "plan_hash");
     if (!json_is_string(op) || !json_is_string(rs) || !json_is_integer(ps) ||
-        json_integer_value(ps) < 1 || !json_is_string(ph)) {
-        return 0;
+        json_integer_value(ps) != RAB_PLAN_SCHEMA_V1 || !json_is_string(ph)) {
+        return 0; /* only an advertised plan schema is accepted */
     }
     if (strlen(json_string_value(op)) >= RAB_REDEEM_STR_MAX ||
         strlen(json_string_value(rs)) >= RAB_REDEEM_STR_MAX) {

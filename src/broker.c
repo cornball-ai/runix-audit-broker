@@ -844,6 +844,23 @@ static void rec_str(json_t *record, const char *key, char *dst, size_t cap) {
 
 static int handle_open(rab_broker *b, const rab_actor *actor,
                        const rab_request *req, char **resp) {
+    /* An effect open binds the record's operation (verb) and resource into the
+     * receipt, and those bound fields MUST equal the audited values exactly. The
+     * intent metadata buffers are RAB_META_MAX, so a longer value would be
+     * silently truncated and the receipt would bind a shortened form of the
+     * audited fields. Refuse such an effect open up front rather than bind a
+     * value that differs from what was audited. */
+    if (req->effect_present) {
+        json_t *jop = json_object_get(req->record, "operation");
+        json_t *jres = json_object_get(req->record, "resource");
+        const char *sop = json_is_string(jop) ? json_string_value(jop) : "";
+        const char *sres = json_is_string(jres) ? json_string_value(jres) : "";
+        if (strlen(sop) >= RAB_META_MAX || strlen(sres) >= RAB_META_MAX) {
+            return reply(resp, rab_response_error(
+                                   "schema_invalid",
+                                   "effect operation/resource too long to bind"));
+        }
+    }
     unsigned long long now = b->clock(b->clock_ctx);
     if (!rate_allowed(b, actor->uid, now)) {
         return reply(resp,
@@ -1247,6 +1264,14 @@ static const char *apply_receipt(rab_broker *b, intent *it,
     if (!it->has_receipt) {
         if (!s->rcpt_is_checkpoint && s->rcpt_state == RAB_RCPT_REDEEMED) {
             return "redeemed receipt transition without a prior issued";
+        }
+        /* The verifier is globally unique (live issuance's mint-time collision
+         * check guarantees it); two DIFFERENT intents carrying the same verifier
+         * on disk is corruption or a collision attack. This intent has no receipt
+         * yet, so any match is necessarily another intent -> fail startup closed
+         * rather than index a duplicate. */
+        if (open_find_verifier(b, s->rcpt_verifier) != NULL) {
+            return "receipt verifier collides with another intent";
         }
         it->has_receipt = 1;
         it->rcpt_state = s->rcpt_state;
@@ -1711,6 +1736,12 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
     if (b->poisoned || out_token == NULL || out_cap < RAB_RECEIPT_MAX) {
         return -1;
     }
+    /* Only a plan schema this broker advertises may be bound into a receipt; an
+     * unadvertised one fails issuance closed (the wire parser already refuses
+     * it, but the internal primitive enforces it independently). */
+    if (plan_schema != RAB_PLAN_SCHEMA_V1) {
+        return -1;
+    }
     intent *it = open_find_cid(b, correlation_id);
     if (it == NULL || it->has_receipt) {
         return -1; /* no such open intent, or it already carries a receipt */
@@ -1764,7 +1795,9 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
     int rc = -1;
     if (line != NULL && append_line(b, line) == 0) {
         /* Durable append + fdatasync succeeded: install the in-memory state
-         * only now (never before durability), and hand back the token. */
+         * only now (never before durability). */
+        unsigned long long nbytes = (unsigned long long) strlen(line) + 1;
+        unsigned long long now = b->clock(b->clock_ctx);
         it->has_receipt = 1;
         it->rcpt_state = RAB_RCPT_ISSUED;
         it->rcpt_actor_uid = it->actor.uid;
@@ -1778,8 +1811,18 @@ int rab_broker_issue_receipt(rab_broker *b, const char *correlation_id,
         snprintf(it->rcpt_plan_hash, sizeof it->rcpt_plan_hash, "%s", plan_hash);
         snprintf(it->rcpt_boot_id, sizeof it->rcpt_boot_id, "%s", boot_id);
         rcpt_index_add(b, it); /* verifier now set: index for wire redeem lookup */
-        snprintf(out_token, out_cap, "%s", token);
-        rc = 0;
+        /* The receipt append is a durable write: account it under the intent's
+         * opener (the bound actor) so per-uid quotas see it and it is carried
+         * across a restart, then rotate if the segment outgrew its cap. */
+        rate_note(b, it->actor.uid, now, nbytes);
+        global_bytes_note(b, now, nbytes);
+        maybe_rotate(b);
+        if (!b->poisoned) {
+            /* hand back the token only now: if rotation left durability
+             * uncertain, fail closed and return none. */
+            snprintf(out_token, out_cap, "%s", token);
+            rc = 0;
+        }
     }
     /* line == NULL: invalid effect params (e.g. bad plan_hash) -> no effect.
      * append failure: append_line already poisoned; out_token stays cleared. */
@@ -1879,12 +1922,25 @@ rab_redeem_result rab_broker_redeem_receipt(rab_broker *b,
     if (line == NULL) {
         return RAB_REDEEM_PERSIST;
     }
+    unsigned long long nbytes = (unsigned long long) strlen(line) + 1;
     int arc = append_line(b, line);
     free(line);
     if (arc != 0) {
         return RAB_REDEEM_PERSIST; /* append_line already poisoned */
     }
     it->rcpt_state = RAB_RCPT_REDEEMED;
+    /* Account the redeemed append under the bound ORIGINAL actor (not the root
+     * redeemer) so the volume is attributed to the principal who initiated the
+     * operation and is carried across a restart, then rotate. A post-append
+     * rotation poisoning is a failure: the redeemed state is durable, but its
+     * durability is uncertain, so do not report success. */
+    unsigned long long now = b->clock(b->clock_ctx);
+    rate_note(b, it->rcpt_actor_uid, now, nbytes);
+    global_bytes_note(b, now, nbytes);
+    maybe_rotate(b);
+    if (b->poisoned) {
+        return RAB_REDEEM_PERSIST;
+    }
     return RAB_REDEEM_OK;
 }
 

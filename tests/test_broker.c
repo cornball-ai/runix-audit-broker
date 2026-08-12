@@ -1057,6 +1057,23 @@ static void test_receipt_reconstruction_conflicts(void) {
               "orphan receipt fails startup closed");
         free(r1);
     }
+
+    /* two DIFFERENT intents carrying the SAME verifier is a collision (live
+     * issuance's mint check makes verifiers unique); reconstruction must fail
+     * startup closed rather than index a duplicate. */
+    {
+        char *ia = mk_intent_line("cid-a", "binda", &a);
+        char *ib = mk_intent_line("cid-b", "bindb", &a);
+        char *ra = mk_rcpt_line("cid-a", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
+        char *rb = mk_rcpt_line("cid-b", RAB_RCPT_ISSUED, 0, RS_V1, "apt.install");
+        char *ls[] = {ia, ra, ib, rb};
+        CHECK(recon_segment(ls, 4, "cid-a", NULL) == 0,
+              "a verifier shared by two intents fails startup closed");
+        free(ia);
+        free(ib);
+        free(ra);
+        free(rb);
+    }
     free(audit);
     free(ckpt);
 }
@@ -2333,6 +2350,70 @@ static void test_effect_open_wire(void) {
     CHECK(rab_broker_receipt_state(b, cid) == 1, "redeemed after restart");
     rab_broker_close(b);
     cleanup_dir(dir);
+
+    /* an effect open whose operation would truncate on binding is refused up
+     * front: the receipt must never bind a shortened form of the audited verb. */
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (effect too long)");
+    rab_broker_test_set_receipt_time(b, rt_mut_boottime, rt_mut_bootid, &clk);
+    {
+        char longop[300];
+        memset(longop, 'x', sizeof longop);
+        longop[sizeof longop - 1] = '\0'; /* 299 chars, past RAB_META_MAX */
+        char body[512];
+        snprintf(body, sizeof body,
+                 "{\"type\":\"open_intent\",\"record\":{\"operation\":\"%s\","
+                 "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                 "\"plan_schema\":1,\"plan_hash\":\"%s\"}}",
+                 longop, EFF_PH);
+        rab_request req;
+        const char *e = NULL;
+        CHECK(rab_parse_request(body, strlen(body), &req, &e) == 0,
+              "parse long-op effect");
+        char *resp = NULL;
+        rab_broker_handle(b, &a, &req, &resp);
+        rab_request_free(&req);
+        CHECK(resp != NULL && strstr(resp, "\"error\":\"schema_invalid\"") != NULL,
+              "over-long effect operation refused (no truncated binding)");
+        free(resp);
+        CHECK(rab_broker_open_count(b) == 0,
+              "the refused over-long effect open opened nothing");
+    }
+    rab_broker_close(b);
+    cleanup_dir(dir);
+}
+
+/* 3c fix: the issued broker_receipt append is a real durable write, counted in
+ * the opener's per-uid op window -- an effect open consumes TWO op slots (the
+ * intent and its receipt), not one, and the accounting is under the opener. */
+static void test_receipt_accounting(void) {
+    char dir[256], path[512];
+    const char *err = NULL;
+    rab_config cfg;
+    rab_config_defaults(&cfg);
+    cfg.rate_max_in_window = 2; /* the window holds exactly intent + its receipt */
+    rab_actor a = mk_actor(1000, 4321, "boot-abc", "555");
+    tmpdir(dir, sizeof dir);
+    sink_path(dir, path, sizeof path);
+    rab_broker *b = rab_broker_open(path, &cfg, test_clock, NULL, &err);
+    CHECK(b != NULL, "broker open (receipt accounting)");
+    char bind[RAB_BINDING_STR_MAX], cid[RAB_CID_MAX], rcpt[RAB_RECEIPT_MAX];
+    CHECK(strcmp(do_open_effect(
+                     b, &a, 1,
+                     "0123456789abcdef0123456789abcdef0123456789abcdef"
+                     "0123456789abcdef",
+                     bind, cid, rcpt),
+                 "OK") == 0,
+          "effect open (accounting)");
+    CHECK(strlen(rcpt) == 32, "receipt issued (accounting)");
+    /* both the intent and its receipt landed in the op window (2/2), so the next
+     * op is rate-limited -- proof the receipt append was accounted. */
+    CHECK(strcmp(do_emit(b, &a, "preview", NULL), "rate_limited") == 0,
+          "the receipt append counts against the per-uid op window");
+    rab_broker_close(b);
+    cleanup_dir(dir);
 }
 #undef EFF_PH
 
@@ -2923,6 +3004,7 @@ int main(void) {
     test_emit();
     test_capabilities();
     test_effect_open_wire();
+    test_receipt_accounting();
     test_carry_forward_idempotency();
     test_rotation_preserves_open_intents();
     test_bounded_open_intents();

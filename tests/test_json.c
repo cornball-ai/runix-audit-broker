@@ -129,11 +129,11 @@ int main(void) {
         const char *err = NULL;
         const char *b = "{\"type\":\"open_intent\",\"record\":"
                         "{\"operation\":\"apt.install\",\"outcome\":\"intent\"},"
-                        "\"effect\":{\"required\":true,\"plan_schema\":2,"
+                        "\"effect\":{\"required\":true,\"plan_schema\":1,"
                         "\"plan_hash\":\"" HEX64 "\"}}";
         CHECK(rab_parse_request(b, strlen(b), &req, &err) == 0, "parse effect");
         CHECK(req.effect_present == 1, "effect present flagged");
-        CHECK(req.effect_plan_schema == 2, "plan_schema extracted");
+        CHECK(req.effect_plan_schema == 1, "plan_schema extracted");
         CHECK(strcmp(req.effect_plan_hash, HEX64) == 0, "plan_hash extracted");
         rab_request_free(&req);
     }
@@ -166,6 +166,11 @@ int main(void) {
                        "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
                        "\"plan_schema\":0,\"plan_hash\":\"" HEX64 "\"}}"),
                  "schema_invalid") == 0, "effect plan_schema 0 rejected");
+    /* an unadvertised plan schema (only 1 is offered) is refused, not bound */
+    CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
+                       "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
+                       "\"plan_schema\":2,\"plan_hash\":\"" HEX64 "\"}}"),
+                 "schema_invalid") == 0, "effect unsupported plan_schema rejected");
     CHECK(strcmp(PARSE("{\"type\":\"open_intent\",\"record\":{\"operation\":\"x\","
                        "\"outcome\":\"intent\"},\"effect\":{\"required\":true,"
                        "\"plan_schema\":-1,\"plan_hash\":\"" HEX64 "\"}}"),
@@ -209,7 +214,7 @@ int main(void) {
         const char *err = NULL;
         const char *b = "{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
                         "\",\"principal_uid\":1000,\"effect\":{\"operation\":"
-                        "\"apt.install\",\"resource\":\"nginx\",\"plan_schema\":3,"
+                        "\"apt.install\",\"resource\":\"nginx\",\"plan_schema\":1,"
                         "\"plan_hash\":\"" HEX64 "\"}}";
         CHECK(rab_parse_request(b, strlen(b), &req, &err) == 0, "parse redeem");
         CHECK(req.type == RAB_REQ_REDEEM, "redeem type");
@@ -217,7 +222,7 @@ int main(void) {
         CHECK(req.redeem_principal_uid == 1000, "principal extracted");
         CHECK(strcmp(req.redeem_verb, "apt.install") == 0, "verb extracted");
         CHECK(strcmp(req.redeem_resource, "nginx") == 0, "resource extracted");
-        CHECK(req.redeem_plan_schema == 3, "redeem plan_schema extracted");
+        CHECK(req.redeem_plan_schema == 1, "redeem plan_schema extracted");
         CHECK(strcmp(req.redeem_plan_hash, HEX64) == 0, "redeem plan_hash extracted");
         rab_request_free(&req);
     }
@@ -254,6 +259,11 @@ int main(void) {
                        "\"resource\":\"y\",\"plan_schema\":0,\"plan_hash\":\""
                        HEX64 "\"}}"), "schema_invalid") == 0,
           "redeem plan_schema 0 rejected");
+    CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
+                       "\",\"principal_uid\":1,\"effect\":{\"operation\":\"x\","
+                       "\"resource\":\"y\",\"plan_schema\":2,\"plan_hash\":\""
+                       HEX64 "\"}}"), "schema_invalid") == 0,
+          "redeem unsupported plan_schema rejected");
     CHECK(strcmp(PARSE("{\"type\":\"redeem_receipt\",\"effect_receipt\":\"" TOK32
                        "\",\"principal_uid\":1,\"effect\":{\"operation\":\"x\","
                        "\"resource\":\"y\",\"plan_schema\":1,\"plan_hash\":"
