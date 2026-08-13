@@ -32,14 +32,23 @@ PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec
 UNITDIR ?= /lib/systemd/system
 
-.PHONY: all test test-receipt test-json test-broker test-socket test-fixtures check fuzz probe asan clean install
+.PHONY: all test test-receipt test-json test-broker test-socket test-fixtures check fuzz probe exercise asan clean install
 all: $(BIN)
 
 # One-shot client used by the activation gate: connect + send one open_intent.
 probe: tools/rab-probe.c src/proto.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o rab-probe $(LDFLAGS)
 
-check: test test-receipt test-json test-broker test-socket test-fixtures
+# VM-only, UNINSTALLED apt-mutation lifecycle driver (never packaged): stands in
+# for the future pkgops issuer so the pkgexec activation slice is acceptance-tested
+# end-to-end on a disposable guest. open_intent(+effect) -> pkexec helper over a
+# private stdin pipe -> outcome, all in one process. Compiled+linked as a CI gate.
+exercise: tools/rab-exercise.c src/proto.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(JSON_CFLAGS) $^ -o rab-exercise $(LDFLAGS) $(JSON_LIBS)
+
+# The VM-only link proofs (exercise, probe) build here too, so CI's `make check`
+# compiles+links them as a mutation-path/activation gate (they are never run in CI).
+check: test test-receipt test-json test-broker test-socket test-fixtures exercise probe
 
 # The full broker binary (needs libjansson-dev + libssl-dev + the JSON/main src).
 $(BIN): $(BROKER_SRC)
@@ -109,7 +118,7 @@ fuzz: fuzz/fuzz_frame.c src/json.c
 clean:
 	rm -f $(BIN) build-test-core build-test-receipt build-test-json \
 	    build-test-broker build-test-socket build-test-fixtures \
-	    build-broker-asan fuzz-proto rab-probe src/*.o
+	    build-broker-asan fuzz-proto rab-probe rab-exercise src/*.o
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) \
